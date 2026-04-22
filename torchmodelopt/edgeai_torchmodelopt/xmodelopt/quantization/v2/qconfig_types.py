@@ -250,6 +250,8 @@ def _apply_qconfig(pmodule, cmodule, cname, qconfig_aux, current_device):
 
 
 def is_softmax_present(node, find_level):
+    if len(node.args) == 0:
+        return False
     if "softmax" in str(node.args[0].target):
         return True
     elif find_level>0:
