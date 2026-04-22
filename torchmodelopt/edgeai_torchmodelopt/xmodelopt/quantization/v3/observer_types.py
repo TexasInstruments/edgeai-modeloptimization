@@ -34,7 +34,8 @@ import math
 import random
 import warnings
 import torch
-import torch.ao.quantization
+# import torch.ao.quantization
+import torchao.quantization
 
 from .... import xnn
 from . import observer_utils
@@ -55,7 +56,8 @@ from . import quant_utils
 
 
 ####################################################################
-class AdaptiveWeightObserver(torch.ao.quantization.MinMaxObserver):
+# class AdaptiveWeightObserver(torch.ao.quantization.MinMaxObserver):
+class AdaptiveWeightObserver(torchao.quantization.pt2e.MinMaxObserver):
     def __init__(self, *args, quant_min=-128, quant_max=+127, dtype=torch.int8, qscheme=torch.per_tensor_symmetric, power2_scale=False, 
                  range_max=None, fixed_range=False, **kwargs):
         super().__init__(*args, quant_min=quant_min, quant_max=quant_max, dtype=dtype, qscheme=qscheme, **kwargs)
@@ -81,8 +83,7 @@ class AdaptiveWeightObserver(torch.ao.quantization.MinMaxObserver):
     @torch.jit.export
     def _calculate_qparams(self, min_val, max_val):
         r"""Calculates the quantization parameters."""
-        scale, zero_point = observer_utils._calculate_qparams(super()._calculate_qparams, 
-                min_val, max_val, self.quant_min, self.quant_max, self.symmetric, self.power2_scale, self.eps)
+        scale, zero_point = observer_utils._calculate_qparams(self, super()._calculate_qparams, min_val, max_val, )
         return scale, zero_point
 
     def forward(self, x_orig):
@@ -110,7 +111,8 @@ class AdaptiveWeightObserver(torch.ao.quantization.MinMaxObserver):
         return x_orig
 
 
-class AdaptivePerChannelWeightObserver(torch.ao.quantization.PerChannelMinMaxObserver):
+# class AdaptivePerChannelWeightObserver(torch.ao.quantization.PerChannelMinMaxObserver):
+class AdaptivePerChannelWeightObserver(torchao.quantization.pt2e.PerChannelMinMaxObserver):
     def __init__(self, *args, quant_min=-128, quant_max=+127, dtype=torch.int8, qscheme=torch.per_channel_symmetric, power2_scale=False, 
                  range_max=None, fixed_range=False, **kwargs):
         super().__init__(*args, quant_min=quant_min, quant_max=quant_max, dtype=dtype, qscheme=qscheme, **kwargs)
@@ -137,8 +139,7 @@ class AdaptivePerChannelWeightObserver(torch.ao.quantization.PerChannelMinMaxObs
     def _calculate_qparams(self, min_val, max_val):
         r"""Calculates the quantization parameters."""
         # weights qparams are always symmetric and this is ensured inside the super class, no need to handle it here.
-        scale, zero_point = observer_utils._calculate_qparams(super()._calculate_qparams, 
-                min_val, max_val, self.quant_min, self.quant_max, self.symmetric, self.power2_scale, self.eps)
+        scale, zero_point = observer_utils._calculate_qparams(self, super()._calculate_qparams, min_val, max_val, )
         return scale, zero_point
 
     def forward(self, x_orig):
@@ -169,7 +170,8 @@ class AdaptivePerChannelWeightObserver(torch.ao.quantization.PerChannelMinMaxObs
 from .observer_utils import AdaptiveWeightRangeClipObserver, AdaptivePerChannelWeightRangeClipObserver
 
 ####################################################################
-class AdaptiveMinMaxActivationObserver(torch.ao.quantization.MinMaxObserver):
+# class AdaptiveMinMaxActivationObserver(torch.ao.quantization.MinMaxObserver):
+class AdaptiveMinMaxActivationObserver(torchao.quantization.pt2e.MinMaxObserver):
     def __init__(self, *args, quant_min=0, quant_max=255, dtype=torch.uint8, qscheme=torch.per_tensor_affine, power2_scale=False, 
                  range_max=None, fixed_range=False, range_shrink=0.0, **kwargs):
         super().__init__(*args, quant_min=quant_min, quant_max=quant_max, dtype=dtype, qscheme=qscheme, **kwargs)
@@ -197,8 +199,7 @@ class AdaptiveMinMaxActivationObserver(torch.ao.quantization.MinMaxObserver):
     @torch.jit.export
     def _calculate_qparams(self, min_val, max_val):
         r"""Calculates the quantization parameters."""
-        scale, zero_point = observer_utils._calculate_qparams(super()._calculate_qparams, 
-                min_val, max_val, self.quant_min, self.quant_max, self.symmetric, self.power2_scale, self.eps)
+        scale, zero_point = observer_utils._calculate_qparams(self, super()._calculate_qparams, min_val, max_val, )
         return scale, zero_point
 
     def forward(self, x_orig):
@@ -226,7 +227,8 @@ class AdaptiveMinMaxActivationObserver(torch.ao.quantization.MinMaxObserver):
         return x_orig
 
 
-class AdaptiveMovingAverageMinMaxActivationObserver(torch.ao.quantization.MovingAverageMinMaxObserver):
+# class AdaptiveMovingAverageMinMaxActivationObserver(torch.ao.quantization.MovingAverageMinMaxObserver):
+class AdaptiveMovingAverageMinMaxActivationObserver(torchao.quantization.pt2e.MovingAverageMinMaxObserver):
     def __init__(self, *args, quant_min=0, quant_max=255, dtype=torch.uint8, qscheme=torch.per_tensor_affine, power2_scale=False, 
                  range_max=None, fixed_range=False, range_shrink=0.0, **kwargs):
         super().__init__(*args, quant_min=quant_min, quant_max=quant_max, dtype=dtype, qscheme=qscheme, **kwargs)
@@ -254,8 +256,7 @@ class AdaptiveMovingAverageMinMaxActivationObserver(torch.ao.quantization.Moving
     @torch.jit.export
     def _calculate_qparams(self, min_val, max_val):
         r"""Calculates the quantization parameters."""
-        scale, zero_point = observer_utils._calculate_qparams(super()._calculate_qparams, 
-                min_val, max_val, self.quant_min, self.quant_max, self.symmetric, self.power2_scale, self.eps)
+        scale, zero_point = observer_utils._calculate_qparams(self, super()._calculate_qparams, min_val, max_val, )
         return scale, zero_point
 
     def forward(self, x_orig):

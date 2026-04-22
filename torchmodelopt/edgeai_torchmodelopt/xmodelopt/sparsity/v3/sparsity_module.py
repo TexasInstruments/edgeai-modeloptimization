@@ -55,7 +55,7 @@ class SparserModule(OptimizationBaseModule):
     
     def __init__(self, module, *args, example_inputs:list=None, example_kwargs:dict=None, sparsity_ratio=None, p=2.0, sparsity_global=False, copy_args=None,
             sparsity_type='n2m', sparsity_m=None, add_methods=True, copy_attrs=None, filter_func_register=None, weight_func_register=None, 
-            sparsity_start_epoch=0, sparsity_end_epoch=1,
+            sparsity_start_epoch=0, sparsity_end_epoch=1,  total_epochs=1,
             transformation_dict=None, **kwargs) -> None:
         """Initializes a SparserModule.
         
@@ -68,6 +68,7 @@ class SparserModule(OptimizationBaseModule):
             p (float, optional): Power parameter for sparsity calculation. Defaults to 2.0.
             sparsity_start_epoch: Epoch where incremental sparsification starts
             sparsity_end_epoch: Epoch where incremental sparsification end, reaching target sparsity
+            total_epochs (int): Total number of epochs of training (to determine when model is finalized)
             sparsity_global (bool, optional): Whether to apply global sparsity across all layers. Defaults to False.
             copy_args (list, optional): List of arguments to copy from the original module. Defaults to None.
             sparsity_type (str, optional): Type of sparsity pattern ('n2m' or 'unstructured'). Defaults to 'n2m'.
@@ -85,11 +86,11 @@ class SparserModule(OptimizationBaseModule):
         example_kwargs = example_kwargs or {}
         super().__init__( module, *args, transformation_dict=transformation_dict, copy_attrs=copy_attrs, **kwargs)
         self.prepare(module, *args, example_inputs=example_inputs, example_kwargs=example_kwargs, sparsity_ratio=sparsity_ratio, p=p, sparsity_global=sparsity_global, copy_args=copy_args,
-            sparsity_type=sparsity_type, sparsity_m=sparsity_m, sparsity_start_epoch=sparsity_start_epoch, sparsity_end_epoch=sparsity_end_epoch,
+            sparsity_type=sparsity_type, sparsity_m=sparsity_m, sparsity_start_epoch=sparsity_start_epoch, sparsity_end_epoch=sparsity_end_epoch, total_epochs=total_epochs,
             add_methods=add_methods, copy_attrs=copy_attrs, filter_func_register=filter_func_register, weight_func_register=weight_func_register, transformation_dict=transformation_dict, **kwargs)
 
     def prepare(self, module, *args, example_inputs:list=None, example_kwargs:dict=None, sparsity_ratio=None, p=2.0, sparsity_global=False, copy_args=None,
-            sparsity_type='n2m', sparsity_m=None, sparsity_start_epoch=0, sparsity_end_epoch=1,
+            sparsity_type='n2m', sparsity_m=None, sparsity_start_epoch=0, sparsity_end_epoch=1, total_epochs=1,
             add_methods=True, copy_attrs=None, filter_func_register=None, weight_func_register=None,  transformation_dict=None, **kwargs):
         """Prepares the module for sparsity training.
         
@@ -108,6 +109,7 @@ class SparserModule(OptimizationBaseModule):
             sparsity_type (str, optional): Type of sparsity pattern ('n2m' or 'unstructured'). Defaults to 'n2m'.
             sparsity_start_epoch: Epoch where incremental sparsification starts
             sparsity_end_epoch: Epoch where incremental sparsification end, reaching target sparsity
+            total_epochs (int): Total number of epochs of training (to determine when model is finalized)
             sparsity_m (int, optional): The m value in n:m sparsity pattern. Defaults to None.
             add_methods (bool, optional): Whether to add sparsity methods to the module. Defaults to True.
             copy_attrs (list, optional): List of attributes to copy from the original module. Defaults to None.
@@ -131,6 +133,7 @@ class SparserModule(OptimizationBaseModule):
         self.sparsity = 0
         self.sparsity_start_epoch = sparsity_start_epoch
         self.sparsity_end_epoch = sparsity_end_epoch
+        self.total_epochs = total_epochs
         self.p = p
             
         self.sparsity_class = SPARSITY_CLASS_DICT[sparsity_type]
@@ -159,7 +162,7 @@ class SparserModule(OptimizationBaseModule):
             raise NotImplementedError
         
         self.module = sparsity_func_wrapper.init(module, *args, example_inputs=example_inputs, example_kwargs=example_kwargs, sparsity_ratio=sparsity_ratio, p=p, sparsity_global=sparsity_global, copy_args=copy_args,
-            sparsity_type=sparsity_type, sparsity_m=sparsity_m, sparsity_start_epoch=sparsity_start_epoch, sparsity_end_epoch=sparsity_end_epoch,
+            sparsity_type=sparsity_type, sparsity_m=sparsity_m, sparsity_start_epoch=sparsity_start_epoch, sparsity_end_epoch=sparsity_end_epoch, total_epochs=total_epochs,
             add_methods=add_methods, copy_attrs=copy_attrs, filter_func_register=filter_func_register, weight_func_register=weight_func_register, transformation_dict=transformation_dict,**kwargs)
 
     #TODO pt2e implementation
@@ -304,7 +307,7 @@ class SparserModule(OptimizationBaseModule):
     
     def step(self):
         """
-        Increment epoch. Assume its called at end
+        Increment epoch. Assume its called at the end of training/testing.
 
         Args:
             module (fx.GraphModule): top level module
@@ -314,6 +317,13 @@ class SparserModule(OptimizationBaseModule):
         )
 
     def finalize(self):
+        """
+        Finalize model training, e.g., permanently apply sparsity. 
+        Assume its called at the end of the last training epoch.
+
+        Args:
+            module (fx.GraphModule): top level module
+        """
         sparsity_func_wrapper.finalize(
             self.module, transformation_dict=self.transformation_dict
         )

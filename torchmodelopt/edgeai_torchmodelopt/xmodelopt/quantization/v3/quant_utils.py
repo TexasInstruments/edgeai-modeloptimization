@@ -43,6 +43,14 @@ from onnxscript import onnx_opset
 
 from .... import xnn
 from torch.fx.passes.utils.source_matcher_utils import get_source_partitions
+
+# from torch.ao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
+from torchao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
+from torch.fx.passes.utils.matcher_with_name_node_map_utils import (
+    SubgraphMatcherWithNameNodeMap,
+)
+from ...utils.helper_functions import WrapperModule, get_attr
+
 # from ...utils import get_source_partitions
 
 
@@ -535,3 +543,141 @@ def add_fc_outlier_supression_hook(model):
                 # all_hooks.append(this_hook2)
                 
     return all_hooks
+
+
+def custom_scaled_dot_prod_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None, enable_gqa=False) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    import math
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    if attn_mask or is_causal:
+        attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    else:
+        attn_bias = None
+    
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias = attn_mask + attn_bias
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    if attn_bias is not None:
+        attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    output = attn_weight @ value
+    return output
+
+def get_args(args, node2node_dict):
+    if isinstance(args, (list, tuple, set)):
+        return type(args)([get_args(arg, node2node_dict) for arg in args])
+    if isinstance(args, dict):
+        result = {}
+        for k,v in args.items():
+            k = get_args(k, node2node_dict)
+            v = get_args(v, node2node_dict)
+            result[k] = v
+        return result
+    if isinstance(args, fx.Node):
+        return node2node_dict[args]
+    return args
+def change_aten_scaled_dot_prod_attention_to_basic_ops(gm:torch.fx.GraphModule):
+    module = WrapperModule(custom_scaled_dot_prod_attention)
+    creator_func = dict(
+        call_function=gm.graph.call_function,
+        call_method=gm.graph.call_method,
+        call_module=gm.graph.call_module,
+        get_attr=gm.graph.get_attr,
+        
+    )
+    for node in list(gm.graph.nodes):
+        if node.target != torch.ops.aten.scaled_dot_product_attention.default:
+            continue
+        args = []
+        for arg in node.args:
+            if isinstance(arg, fx.Node):
+                if 'val' not in arg.meta:
+                    raise KeyError(f'{arg} does not have val in to create a tensor  out of it')
+                t = arg.meta['val']
+                args.append(torch.rand(t.shape).to(device=t.device).to(dtype=t.dtype))
+            else:
+                args.append(arg)
+        kwargs = copy.copy(node.kwargs)
+        replacement = torch.export.export(module, tuple(args), kwargs).module(check_guards=False)
+        output_nodes = [n for n in replacement.graph.nodes if n.op == 'output'][0].args[0]
+        if len(output_nodes)!= 1:
+            raise ValueError(f'replacement created for {node} must have 1 output but has {len(output_nodes)} outputs ')
+        output_node = output_nodes[0]
+        placeholders = [n for n in replacement.graph.nodes if n.op == 'placeholder']
+        node_args = [arg for arg in node.args if isinstance(arg, fx.Node)]
+        new_node_to_orig_node_map = dict(zip(placeholders,node_args))
+        nn_module_stack = node.meta['nn_module_stack']
+        stack_trace = node.meta['stack_trace']
+        with gm.graph.inserting_before(node):
+            for new_node in replacement.graph.nodes:
+                if new_node.op in ('placeholder', 'output'):
+                    continue
+                args = get_args(new_node.args, new_node_to_orig_node_map)
+                kwargs = copy.copy(new_node.kwargs)
+                if new_node.op == 'get_attr':
+                    attr = get_attr(replacement, new_node.target)
+                    target = new_node.target
+                    target += f'_{len([n for n in gm.graph.nodes if n.op == "get_attr" and n.target.startswith(target)])}'
+                    target = target.replace('.', '_')
+                    if isinstance(attr, torch.nn.Parameter):
+                        attr = torch.nn.Parameter(attr.data,attr.requires_grad)
+                        gm.register_parameter(target, attr)
+                    elif isinstance(attr, torch.Tensor):
+                        gm.register_buffer(target, attr)
+                    else:
+                        setattr(gm, target, attr)
+                    orig_node = creator_func[node.op](target)
+                elif new_node.op == 'call_module':
+                    raise ValueError(f'there should not be any call_module node in pt2e exported model.')
+                    # TODO implement Call_module node addition
+                else:
+                    orig_node = creator_func[node.op](new_node.target, args, kwargs, )
+                new_node_to_orig_node_map[new_node] = orig_node
+                new_nn_module_stack = copy.deepcopy(nn_module_stack)
+                orig_node.meta.update(dict(
+                    nn_module_stack=new_nn_module_stack,
+                    stack_trace=stack_trace+'\n  '+new_node.meta['stack_trace'],
+                    torch_fn=new_node.meta['torch_fn'],
+                    val=new_node.meta['val'],
+                    tensor_meta=new_node.meta['tensor_meta']
+                    #TODO add from node meta :- 
+                ))
+            node.replace_all_uses_with(new_node_to_orig_node_map[output_node])
+            gm.graph.erase_node(node)
+        gm.graph.lint()
+    # gm.graph.eliminate_dead_code()
+    
+    gm.recompile()
+    return gm
+
+def change_view_to_reshape(gm: torch.fx.GraphModule):
+    for node in gm.graph.nodes:
+        if node.target == torch.ops.aten.view.default:
+            node.target = torch.ops.aten.reshape.default
+    gm.recompile()
+    return gm
+
+OPT_FUNCS = (
+    change_aten_scaled_dot_prod_attention_to_basic_ops,
+    change_view_to_reshape,
+)
+
+def optimize_graph_module_for_quantization(gm_module: torch.fx.GraphModule):
+    for opt_func in OPT_FUNCS:
+        gm_module = opt_func(gm_module)
+    return gm_module

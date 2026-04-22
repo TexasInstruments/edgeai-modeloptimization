@@ -11,8 +11,10 @@ from .parametrization import SPARSITY_CLASS_DICT
 from ... import utils
 from ...utils.helper_functions import get_parent_name, nested_getattr
 
+DEBUG_MODE = False
+
 def init(module, *args, example_inputs:list=None, example_kwargs:dict=None, sparsity_ratio=None, p=2.0, sparsity_global=False, copy_args=None,
-            sparsity_type='n2m', sparsity_m=None, sparsity_start_epoch=0, sparsity_end_epoch=1,
+            sparsity_type='n2m', sparsity_m=None, sparsity_start_epoch=0, sparsity_end_epoch=1, total_epochs=1,
             add_methods=True, copy_attrs=None, filter_func_register=None, weight_func_register=None, **kwargs):
     """Initializes a module for sparsity training.
     
@@ -39,6 +41,7 @@ def init(module, *args, example_inputs:list=None, example_kwargs:dict=None, spar
         weight_func_register (function, optional): Custom function to register weight functions. Defaults to None.
         sparsity_start_epoch: Epoch where incremental sparsification starts
         sparsity_end_epoch: Epoch where incremental sparsification end, reaching target sparsity
+        total_epochs (int): Total number of epochs of training (to determine when model is finalized)
         **kwargs: Additional keyword arguments for sparsity initialization.
         
     Returns:
@@ -55,12 +58,8 @@ def init(module, *args, example_inputs:list=None, example_kwargs:dict=None, spar
     mode = kwargs.get('mode', 'topk')  # Default sparsity mode is 'topk'
     
     # Ensure module has example inputs/kwargs for tracing/export
-    if not (hasattr(module, '_example_inputs') and hasattr(module, '_example_kwargs')):
-        # This should not get called unless this function is called separately, when called from wrapper model should have example inputs and kwargs
-        # Add example inputs/kwargs to the module if not already present
-        utils.add_example_args_kwargs(module, example_inputs=example_inputs, example_kwargs=example_kwargs)
-    example_inputs = module._example_inputs.pop(0)
-    example_kwargs = module._example_kwargs.pop(0)
+    # If it is given via args, use that
+    
     
     # Handle different module types: use as is if already a GraphModule, otherwise export it
     if isinstance(module,fx.GraphModule):
@@ -68,13 +67,22 @@ def init(module, *args, example_inputs:list=None, example_kwargs:dict=None, spar
         # Assuming Default pt2e here
         gm_module = module
     else:
+        if not example_inputs:
+            # if not (hasattr(module, '_example_inputs') and hasattr(module, '_example_kwargs')):
+            #     # This should not get called unless this function is called separately, when called from wrapper model should have example inputs and kwargs
+            #     # Add example inputs/kwargs to the module if not already present
+            #     utils.add_example_args_kwargs(module, example_inputs=example_inputs, example_kwargs=example_kwargs)
+            example_inputs = module._example_inputs[0]
+            example_kwargs = module._example_kwargs[0]
         # Convert PyTorch module to GraphModule using torch.export
         example_inputs = tuple(example_inputs)
         check_guards = kwargs.get('check_guards', True)
         gm_module = torch.export.export(module, example_inputs, kwargs=example_kwargs).module(check_guards=check_guards)
+        gm_module._example_inputs = example_inputs
+        gm_module._example_kwargs = example_kwargs
         # Add train() and eval() methods to the exported model
         from ...utils.helper_functions import allow_exported_model_train_eval
-        allow_exported_model_train_eval(gm_module)
+        allow_exported_model_train_eval(gm_module, old_mode=module.training)
     
     # Initialize sparsity parameters attribute dictionary
     gm_module.__sparse_params__ = xnn.utils.AttrDict()
@@ -83,10 +91,11 @@ def init(module, *args, example_inputs:list=None, example_kwargs:dict=None, spar
 
     gm_module.__sparse_params__.epoch_count = 0  # Track current training epoch
     gm_module.__sparse_params__.sparsity_ratio = sparsity_ratio  # Target sparsity level
-    # gm_module.__sparse_params__.total_epochs = total_epochs  # Total training epochs
+    gm_module.__sparse_params__.total_epochs = total_epochs  # Total training epochs
     gm_module.__sparse_params__.sparsity = 0  # Current sparsity level (will be updated)
     # gm_module.__sparse_params__.init_train_ep = sparsity_init_train_ep  # Initial training epochs
     gm_module.__sparse_params__.p = p  # Power parameter for mask calculation
+    
     
 
     # Collect all the args used to initialize the parametrization class here. This would make REQUIRED_PARAMS unnecessary. 
@@ -190,7 +199,7 @@ def init(module, *args, example_inputs:list=None, example_kwargs:dict=None, spar
         gm_module._insert_and_remove_parametrization_during_training = types.MethodType(insert_and_remove_parametrization_during_training, gm_module) 
         
         # Backup original train method and override with sparsity-aware versions
-        gm_module.__sparsity_train_backup__ = types.MethodType(module.train.__func__, gm_module)
+        gm_module.__sparsity_train_backup__ = types.MethodType(gm_module.train.__func__, gm_module)
         gm_module.train = types.MethodType(train, gm_module)
         gm_module.eval = types.MethodType(train, gm_module)
         
@@ -252,9 +261,15 @@ def train(module, mode: bool = True):
     if hasattr(module, "__sparsity_train_backup__"):
         # First execute the original train method
         module.__sparsity_train_backup__(mode=mode)
+    
+    # TODO: better handling of step
+    if not DEBUG_MODE:
+        if mode: # Training mode
+            step(module)
+        elif module.__sparse_params__.epoch_count==module.__sparse_params__.total_epochs:
+            # At the final epoch, finalize sparsity by applying hard binary masks
+            finalize(module)
         
-    # Then handle parametrization insertion/removal for sparsity
-    module = module._insert_and_remove_parametrization_during_training(mode)
     return module
 
 def eval(self, mode: bool = False):
@@ -280,17 +295,42 @@ def eval(self, mode: bool = False):
     return train(self, mode)
 
 def step(module):
+    """
+        Increment epoch_count. Assume its called at the end of training/testing.
+        Update each parametrization object, notifying them that an epoch has passed.
+        Calls update_all_parametrizations
+
+        Args:
+            module (fx.GraphModule): top level module
+    """
     module.__sparse_params__.epoch_count += 1
     update_all_parametrizations(module)
-    # print(f'steppin {module.__sparse_params__.epoch_count}')
     return module 
 
 def finalize(module):
+    """
+        Finalize model training. Assume its called at the end of the last training epoch.
+
+        Remove all added parametrizations, permanently applying them to sparsify weights.
+
+        Throws:
+            AssertionError, if finalize is called before sparsity_end_epoch, which would mean 
+            the model is prematurely finalized before full sparsity is applied.
+
+        Args:
+            module (fx.GraphModule): top level module
+    """
     update_all_parametrizations(module, binary_mask=True) # note: this does increment an additional epoch, but should be fine
     sample_parametrization = module.__sparse_params__.parametrization_list[0][3] # (parent_module, parent_module_name, param_name, parametrization)
     print(f'Finalizing model by permanently sparsifying params.\n Current epoch: {sample_parametrization.current_epoch}')
-    assert sample_parametrization.current_epoch >= sample_parametrization.sparsity_end_epoch, f'Prematurely finalized incremental sparsity'
+    if sample_parametrization.current_epoch < sample_parametrization.sparsity_end_epoch:
+        print(f'WARNING: Prematurely finalized incremental sparsity before end epoch {sample_parametrization.sparsity_end_epoch}')
     remove_all_parametrizations(module, leave_parametrized=True)  
+
+    # Calculate and report final sparsity level
+    calculate_sparsity(module)
+    print("The final sparsity of the network is {}".format(module.__sparse_params__.sparsity))
+
     return module
 
 def insert_and_remove_parametrization_during_training(module, mode: bool = True):
@@ -510,22 +550,26 @@ def update_all_parametrizations(module:fx.GraphModule, binary_mask:bool =False) 
         module (fx.GraphModule): Parent module
         binary_mask (bool, optional): passed on to parametrization update function. Defaults to False.
     """
-    debug = False
-    if debug:
+    if DEBUG_MODE:
         flip_rate_list = []
         scale_list = []
         current_epoch = -1
+        forward_counter = -1
         for (parent_module, parent_module_name, param_name, parametrization) in module.__sparse_params__.parametrization_list:
             if parametrize.is_parametrized(parent_module, param_name):
                 param_tensor = nested_getattr(parent_module, f'parametrizations.{param_name}.original') # get original param
-                old_mask = (parametrization.mask == 1) # also works for topk where masked element is nonzero
+                scaled_1 = parametrization.mask.max().item()
+                old_mask = (parametrization.mask == scaled_1) # also works for topk where masked element is nonzero
                 new_mask = parametrization.update(tensor=param_tensor, binary_mask=binary_mask)
-                new_mask = (new_mask==1)
+                scaled_1 = parametrization.mask.max().item()
+                new_mask = (new_mask==scaled_1)
                 flip_rate = (old_mask!=new_mask).sum()/(old_mask.numel())
                 flip_rate_list.append(flip_rate)
                 if hasattr(parametrization, 'scale_weight_factor') and parametrization.scale_weight_factor is not None:
                     scale_list.append(parametrization.scale_weight_factor)
                 current_epoch = parametrization.current_epoch
+                if hasattr(parametrization, 'forward_counter'):
+                    forward_counter = parametrization.forward_counter
         flip_rate_avg = torch.tensor(flip_rate_list).mean().item()
         scale_avg = torch.tensor(scale_list).mean().item()
         
@@ -536,6 +580,7 @@ def update_all_parametrizations(module:fx.GraphModule, binary_mask:bool =False) 
                 if current_epoch > 1:
                     mlflow.log_metric('avg_flip_rate', flip_rate_avg, step=current_epoch)
                     mlflow.log_metric('avg_weight_scale', scale_avg, step=current_epoch)
+                    # mlflow.log_metric('forward_counter', forward_counter, step=current_epoch)
         except Exception:
             pass
     else:

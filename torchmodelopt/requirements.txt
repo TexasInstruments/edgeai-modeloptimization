@@ -8,5 +8,6 @@ torchinfo
 onnxsim
 pydot
 torch
+torchao
 onnx==1.16.1
 onnx-graphsurgeon

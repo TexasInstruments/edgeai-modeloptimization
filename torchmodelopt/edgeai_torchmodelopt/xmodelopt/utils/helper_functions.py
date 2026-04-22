@@ -7,6 +7,7 @@ import types
 from torch.fx.passes.utils.source_matcher_utils import SourcePartition
 import importlib
 from functools import reduce
+from collections import UserDict, OrderedDict
 
 
 def get_module(m: torch.nn.Module, target:str):
@@ -378,14 +379,14 @@ def _change_arg_or_kwargs_(m:fx.GraphModule, fn_1, fn_2, example_inputs, example
         example_inputs,
         example_kwargs,
         strict=True,
-    ).module()
+    ).module(check_guards=False)
     
     fn_2 = torch.export.export(
         fn_2,  # type: ignore[arg-type]
         example_inputs,
         example_kwargs,
         strict=True,
-    ).module()
+    ).module(check_guards=False)
     
 
     bool_dict = {}
@@ -398,38 +399,39 @@ def _change_arg_or_kwargs_(m:fx.GraphModule, fn_1, fn_2, example_inputs, example
         n2.name += '_eval'
         if n1.op != n2.op :
             raise ValueError (f'{n1}.op ({n1.op}) should be equal to {n2}.op ({n2.op})')
-        if n1.op != 'call_function':
-            continue
-        if n1.target != n2.target :
-            raise ValueError (f'{n1}.target ({n1.target}) should be equal to {n2}.target ({n2.target})')
-        if len(n1.args) != len(n2.args) or len(n1.kwargs) != len(n2.kwargs):
-            raise ValueError (f'length of {n1}\'s args ({len(n1.args)}) or kwargs ({len(n1.kwargs)}) should be equal to length of {n2}\'s args ({len(n2.args)}) or kwargs ({len(n2.kwargs)})')
-        if not all(k in n2.kwargs for k in n1.kwargs):
-            raise ValueError(f'kwargs of {n1} ({list(n1.kwargs.keys())}) does not match with ({n2}) ({list(n2.kwargs.keys())})')
-        for k in n1.kwargs:
-            v1 = n1.kwargs[k]
-            v2 = n2.kwargs[k]
-            if v1.__class__ != v1.__class__:
-                keys.append(k)
-                continue
-            if isinstance(v1, fx.Node) and bool_dict.get((v1.name, v2.name), False):
-                keys.append(k)
-                continue
-            if v1 != v2:
-                keys.append(k)
-        for i, (v1, v2) in enumerate(zip(n1.args, n2.args)):
-            if v1.__class__ != v1.__class__:
-                args.append(i)
-                continue
-            if isinstance(v1, fx.Node) and bool_dict.get((v1.name, v2.name), False):
-                args.append(i)
-                continue
-            if v1 != v2:
-                args.append(i)
+        if n1.op == 'call_function':
+            if n1.target != n2.target :
+                raise ValueError (f'{n1}.target ({n1.target}) should be equal to {n2}.target ({n2.target})')
+            if len(n1.args) != len(n2.args) or len(n1.kwargs) != len(n2.kwargs):
+                raise ValueError (f'length of {n1}\'s args ({len(n1.args)}) or kwargs ({len(n1.kwargs)}) should be equal to length of {n2}\'s args ({len(n2.args)}) or kwargs ({len(n2.kwargs)})')
+            if not all(k in n2.kwargs for k in n1.kwargs):
+                raise ValueError(f'kwargs of {n1} ({list(n1.kwargs.keys())}) does not match with ({n2}) ({list(n2.kwargs.keys())})')
+            for k in n1.kwargs:
+                v1 = n1.kwargs[k]
+                v2 = n2.kwargs[k]
+                if v1.__class__ != v1.__class__:
+                    keys.append(k)
+                    continue
+                if isinstance(v1, fx.Node) and bool_dict.get((v1.name, v2.name), False):
+                    keys.append(k)
+                    continue
+                if v1 != v2:
+                    keys.append(k)
+            for i, (v1, v2) in enumerate(zip(n1.args, n2.args)):
+                if v1.__class__ != v2.__class__:
+                    args.append(i)
+                    continue
+                if isinstance(v1, fx.Node):
+                    if not bool_dict.get((v1.name, v2.name), False):
+                        args.append(i)
+                    continue
+                if v1 != v2:
+                    args.append(i)
         if len(args+keys) == 0:
             bool_dict[(n1.name, n2.name)] = True
             continue
         fn = n1.target
+        bool_dict[(n1.name, n2.name)] = False
         break
     
     if fn is None:
@@ -579,6 +581,8 @@ def _move_exported_model_to_train(model, mode: bool=True):
         
     # Set the training attribute and update batchnorm and dropout nodes
     setattr(model, _EXPORTED_TRAINING_ATTR, mode)
+    if hasattr(model, 'training'):
+        model.training = mode
     _replace_dropout(model, not mode)        
     _replace_batchnorm(model, not mode)        
     return model
@@ -596,7 +600,7 @@ def _move_exported_model_to_eval(model):
     return _move_exported_model_to_train(model, False)
 
 
-def allow_exported_model_train_eval(model: fx.GraphModule):
+def allow_exported_model_train_eval(model: fx.GraphModule, old_mode:bool = False):
     """Adds train() and eval() methods to an exported model.
     
     This function adds train() and eval() methods to an exported model, allowing
@@ -604,6 +608,8 @@ def allow_exported_model_train_eval(model: fx.GraphModule):
     
     Args:
         model (fx.GraphModule): The exported model to modify.
+        old_mode (bool): The training mode of the model before export. This is used since
+            model.training may not be correctly set after export.
         
     Returns:
         fx.GraphModule: The model with train() and eval() methods added.
@@ -619,6 +625,7 @@ def allow_exported_model_train_eval(model: fx.GraphModule):
     def _eval(self):
         _move_exported_model_to_eval(self)
 
+    model.training = old_mode
     # Attach the methods to the model
     model.train = types.MethodType(_train, model)  # type: ignore[method-assign]
     model.eval = types.MethodType(_eval, model)  # type: ignore[method-assign]
@@ -637,7 +644,7 @@ def get_tensors_to_device(entries, device):
         The input object with any contained tensors moved to the specified device.
     """
     # Handle dictionary inputs
-    if isinstance(entries, dict):
+    if isinstance(entries, (dict, UserDict, OrderedDict)):
         for k,v in entries.items():
             entries[k] = get_tensors_to_device(v, device)
     # Handle collection inputs
@@ -673,23 +680,28 @@ def _model_to_device(model, device):
         # Move the model parameters and buffers to the specified device
         model.to(device)
         
-        # TODO to handle cases where device are not used for tensors or in some edge cases 
-        if isinstance(model, torch.fx.GraphModule):
-            # For GraphModules, we also need to update any torch.device objects 
-            # referenced in the computational graph
-            for node in list(model.graph.nodes):
-                # Update any device objects in the node's positional arguments
-                for i, a in enumerate(node.args):
-                    if isinstance(a, torch.device):
-                        node.update_arg(i, device)
+        for n, module in dict(model.named_modules()).items():
+            # TODO to handle cases where device are not used for tensors or in some edge cases 
+            if isinstance(module, torch.fx.GraphModule):
+                # For GraphModules, we also need to update any torch.device objects 
+                # referenced in the computational graph
+                for node in list(module.graph.nodes):
+                    # Update any device objects in the node's positional arguments
+                    for i, a in enumerate(node.args):
+                        if isinstance(a , str) and any(d in a for d in ('cpu', 'cuda')):
+                            node.update_arg(i, str(device))
+                        if isinstance(a, torch.device):
+                            node.update_arg(i, device)
+                    
+                    # Update any device objects in the node's keyword arguments
+                    for k,v in node.kwargs.items():
+                        if isinstance(v , str) and any(d in v for d in ('cpu', 'cuda')):
+                            node.update_arg(k, str(device))
+                        if isinstance(v, torch.device):
+                            node.update_kwarg(k, device)
                 
-                # Update any device objects in the node's keyword arguments
-                for k,v in node.kwargs.items():
-                    if isinstance(v, torch.device):
-                        node.update_kwarg(k, device)
-            
-            # Recompile the graph to ensure changes take effect
-            model.recompile()
+                # Recompile the graph to ensure changes take effect
+                module.recompile()
         #
     #
     return model

@@ -34,24 +34,30 @@
 import copy
 from typing import Callable, Optional, List
 import itertools
+import types
 import torch
 import torch.nn.functional as F
 from torch.fx import Node
-from torch.ao.quantization.pt2e.utils import (
+# from torch.ao.quantization.pt2e.utils import (
+from torchao.quantization.pt2e.utils import (
     _get_aten_graph_module_for_pattern,
     _is_conv_node,
     _is_conv_transpose_node,
 )
-from torch.ao.quantization.quantizer.utils import (
-    _annotate_input_qspec_map,
-    _annotate_output_qspec,
+# from torch.ao.quantization.quantizer.utils import (
+from torchao.quantization.pt2e.quantizer.utils import (
+    annotate_input_qspec_map as _annotate_input_qspec_map,
+    annotate_output_qspec as  _annotate_output_qspec,
 )
-from torch.ao.quantization.quantizer import (
+# from torch.ao.quantization.quantizer import (
+from torchao.quantization.pt2e.quantizer import (
     QuantizationAnnotation,
     QuantizationSpec,
-    SharedQuantizationSpec
+    SharedQuantizationSpec,
+    QuantizationSpecBase
 )
-from torch.ao.quantization.pt2e.export_utils import _WrapperModule
+# from torch.ao.quantization.pt2e.export_utils import _WrapperModule
+from torchao.quantization.pt2e.export_utils import WrapperModule as _WrapperModule
 from torch.fx.passes.utils.matcher_with_name_node_map_utils import (
     SubgraphMatcherWithNameNodeMap,
 )
@@ -205,14 +211,11 @@ def _do_annotate_conv_mul_add(
         input_qspec_map[weight_node] = get_weight_qspec(quantization_config)
         if bias_node is not None:
             input_qspec_map[bias_node] = get_bias_qspec(quantization_config)
-        conv_node.meta["quantization_annotation"] = QuantizationAnnotation(
-            input_qspec_map=input_qspec_map,
-            _annotated=True,
-        )
-        output_node.meta["quantization_annotation"] = QuantizationAnnotation(
-            output_qspec=get_output_act_qspec(quantization_config),  # type: ignore[arg-type]
-            _annotated=True,
-        )
+        for node, qspec in input_qspec_map.items():
+            _annotate_input_qspec_map(conv_node, node, qspec)
+        
+        _annotate_output_qspec(output_node, get_output_act_qspec(quantization_config))
+        
         _mark_nodes_as_annotated(partition)
         annotated_partitions.append(partition)
     return annotated_partitions
@@ -308,16 +311,13 @@ def _annotate_mul_add(
                 continue
             partition.append(input_act1)
             input_qspec_map[input_act1] = input_act_qspec
-
-        mul_node.meta["quantization_annotation"] = QuantizationAnnotation(
-            input_qspec_map=input_qspec_map,
-            _annotated=True,
-        )
-        add_node.meta["quantization_annotation"] = QuantizationAnnotation(
-            output_qspec=output_act_qspec,
-            _annotated=True,
-        )
+        
+        for node, qspec in input_qspec_map.items():
+            _annotate_input_qspec_map(mul_node, node, qspec)
+        
+        _annotate_output_qspec(add_node, output_act_qspec)
         annotated_partitions.append(partition)
+    
     return annotated_partitions
 
 
@@ -384,14 +384,10 @@ def _do_annotate_linear_add(
             input_qspec_map[input_weight] = input_weight_qspec
 
         _mark_nodes_as_annotated(partition)
-        linear_node.meta["quantization_annotation"] = QuantizationAnnotation(
-            input_qspec_map=input_qspec_map,
-            _annotated=True,
-        )
-        output_node.meta["quantization_annotation"] = QuantizationAnnotation(
-            output_qspec=output_act_qspec,
-            _annotated=True,
-        )
+        for node, qspec in input_qspec_map.items():
+            _annotate_input_qspec_map(linear_node, node, qspec)
+        
+        _annotate_output_qspec(output_node, output_act_qspec)
         annotated_partitions.append(partition)
     return annotated_partitions
 
@@ -412,43 +408,201 @@ def _annotate_linear_add_relu(
     filter_fn: Optional[Callable[[Node], bool]] = None
 ) -> Optional[list[list[Node]]]:
     return _do_annotate_linear_add(gm, quantization_config, filter_fn, has_relu=True)
-    
 
-@register_annotator('matmul')
-def _annotate_matmul(
+
+def _do_annotate_matmul(
     gm: torch.fx.GraphModule,
     quantization_config: Optional[QuantizationConfig],
     filter_fn: Optional[Callable[[Node], bool]] = None,
+    has_add: bool = False,
+    has_relu = False
 ) -> Optional[list[list[Node]]]:
-
     # matmul is currently not quantized
     # quantizing it needs carefull handling of attention layers
     annotated_partitions = []
-#     for node in gm.graph.nodes:
-#         if node.op != "call_function" or node.target != torch.ops.aten.matmul.default:
-#             continue
-#         if filter_fn and not filter_fn(node):
-#             continue
+    is_node_variable_dict = gm._is_node_variable_dict
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.matmul.default:
+            continue
+        # if filter_fn and not filter_fn(node):
+        #     continue
 
-#         matmul_node = node
-#         nodes_to_mark_annotated = [matmul_node]
+        matmul_node = node
+        nodes_to_mark_annotated = [matmul_node]
+        
+        input_act_qspec = get_input_act_qspec(quantization_config)
+        input_weight_qspec = get_weight_qspec(quantization_config)
+        output_act_qspec = get_output_act_qspec(quantization_config)
+        
+        input1, input2 = matmul_node.args
+        
+        var1 = isinstance(input1, Node) and is_node_variable_dict[input1]
+        var2 = isinstance(input2, Node) and is_node_variable_dict[input2]
+        
+        input_type_qscheme_map = {
+            (True,True)  : (torch.per_tensor_symmetric, torch.per_tensor_symmetric,  torch.per_tensor_symmetric),
+            (True,False) : (torch.per_tensor_symmetric, torch.per_channel_symmetric, torch.per_tensor_symmetric),
+            (False,True) : (torch.per_tensor_symmetric, torch.per_tensor_symmetric,  torch.per_tensor_symmetric),
+            (False,False): (torch.per_tensor_symmetric, torch.per_channel_symmetric, torch.per_tensor_symmetric),
+        }
+        
+        from ...qconfig_types import create_qspec_deepcopy_with_kwargs
+        specs = [input_act_qspec, input_weight_qspec, output_act_qspec]
+        for i, spec in enumerate(specs):
+            if spec is None:
+                continue
+            if spec.qscheme in (torch.per_channel_symmetric, torch.per_tensor_symmetric):
+                continue
+            if spec.qscheme == torch.per_tensor_affine:
+                specs[i] = create_qspec_deepcopy_with_kwargs(spec, quantization_config.is_qat, qscheme=torch.per_tensor_symmetric)
+            if spec.qscheme == torch.per_channel_affine:
+                specs[i] = create_qspec_deepcopy_with_kwargs(spec, quantization_config.is_qat, qscheme=torch.per_channel_symmetric)
 
-#         if len(node.users) == 1:
-#             next_node = node.users[0]
-#             if next_node.op == "call_function" and next_node.target in [torch.ops.aten.add.Tensor, torch.ops.aten.add_.Tensor]:
-#                 add_node = next_node
-#                 nodes_to_mark_annotated += [add_node]
-#                 # add_node.meta["quantization_annotation"] = QuantizationAnnotation(
-#                 #         input_qspec_map=input_qspec_map,
-#                 #         output_qspec=output_act_qspec,
-#                 #         _annotated=True,
-#                 #     )
+        input_act_qspec, input_weight_qspec, output_act_qspec = specs
+        input_qspec_map = {}
+        
+        # input_act_qspec.qscheme
+        # if var2 is True:
+            # continue
+        if isinstance(input1, Node):
+            nodes_to_mark_annotated.append(input1)
+            input_qspec_map[input1] = input_act_qspec
+        
+        if isinstance(input2, Node):
+            nodes_to_mark_annotated.append(input2)
+            input_qspec_map[input2] = input_act_qspec
+        
+        current_node = matmul_node
+        out_node = None
+        if has_add and len(current_node.users) == 1:
+            next_node = list(current_node.users.keys())[0]
+            if next_node.op == "call_function" and next_node.target in [torch.ops.aten.add.Tensor, torch.ops.aten.add_.Tensor]:
+                out_node = next_node
+                nodes_to_mark_annotated = [out_node] + nodes_to_mark_annotated
+                current_node = out_node
+        if has_relu and len(current_node.users)==1:
+            next_node = list(current_node.users.keys())[0]
+            if next_node.op == "call_function" and next_node.target in [torch.ops.aten.relu.default, torch.ops.aten.relu_.default]:
+                out_node = next_node
+                nodes_to_mark_annotated = [out_node] + nodes_to_mark_annotated
+        
+        if _is_annotated(nodes_to_mark_annotated):
+            continue
+        if filter_fn and any(not filter_fn(n) for n in nodes_to_mark_annotated):
+            continue
     
-#         _mark_nodes_as_annotated(nodes_to_mark_annotated)
-#         annotated_partitions.append(nodes_to_mark_annotated)
+        for node, qspec in input_qspec_map.items():
+            _annotate_input_qspec_map(matmul_node, node, qspec)
+        
+        _annotate_output_qspec(out_node or matmul_node, output_act_qspec)
+        
+        # if out_node:
+        #     if 'quantization_annotation' not in out_node.meta or not out_node.meta["quantization_annotation"]._annotated :
+        #         out_node.meta["quantization_annotation"] = QuantizationAnnotation(
+        #                 # input_qspec_map=input_qspec_map,
+        #                 output_qspec=output_act_qspec,
+        #                 _annotated=True,
+        #             )
+        #     matmul_node.meta["quantization_annotation"] = QuantizationAnnotation(
+        #             input_qspec_map=input_qspec_map,
+        #             # output_qspec=output_act_qspec,
+        #             _annotated=True,
+        #         )
+        # else:
+        #     matmul_node.meta["quantization_annotation"] = QuantizationAnnotation(
+        #             input_qspec_map=input_qspec_map,
+        #             output_qspec=output_act_qspec,
+        #             _annotated=True,
+        #         )
+    
+        _mark_nodes_as_annotated(nodes_to_mark_annotated)
+        annotated_partitions.append(nodes_to_mark_annotated)
 
     return annotated_partitions
 
+
+@register_annotator('matmul')
+def annotate_matmul(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+    ):
+    return _do_annotate_matmul(gm, quantization_config, filter_fn,)
+
+
+@register_annotator('matmul_add')
+def annotate_matmul(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+    ):
+    return _do_annotate_matmul(gm, quantization_config, filter_fn, has_add=True)
+
+
+@register_annotator('matmul_relu')
+def annotate_matmul(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+    ):
+    return _do_annotate_matmul(gm, quantization_config, filter_fn, has_relu=True)
+
+
+@register_annotator('matmul_add_relu')
+def annotate_matmul(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+    ):
+    return _do_annotate_matmul(gm, quantization_config, filter_fn, has_add=True, has_relu=True)
+
+
+@register_annotator('layernorm')
+def annotate_layernorm(    
+        gm: torch.fx.GraphModule,
+        quantization_config: Optional[QuantizationConfig],
+        filter_fn: Optional[Callable[[Node], bool]] = None,
+    ):
+    annotated_partitions = []
+    input_act_qspec = get_input_act_qspec(quantization_config)
+    output_act_qspec = get_output_act_qspec(quantization_config)
+    weight_qspec = get_weight_qspec(quantization_config)
+    bias_qspec = get_bias_qspec(quantization_config)
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != torch.ops.aten.layer_norm.default:
+            continue
+        if filter_fn and not filter_fn(node):
+            continue
+        act_node = node.args[0]
+        weight_node = node.args[2]
+        bias_node = None
+        if len(node.args) > 3:
+            bias_node = node.args[3]
+
+        if _is_annotated([node]) is False:  # type: ignore[list-item]
+            _annotate_input_qspec_map(
+                node,
+                act_node,
+                input_act_qspec,
+            )
+            _annotate_input_qspec_map(
+                node,
+                weight_node,
+                weight_qspec,
+            )
+            nodes_to_mark_annotated = [node, weight_node]
+            if bias_node:
+                _annotate_input_qspec_map(
+                    node,
+                    bias_node,
+                    bias_qspec,
+                )
+                nodes_to_mark_annotated.append(bias_node)
+            _annotate_output_qspec(node, output_act_qspec)
+            _mark_nodes_as_annotated(nodes_to_mark_annotated)
+            annotated_partitions.append(nodes_to_mark_annotated)
+
+    return annotated_partitions
 
 def _prepend_list(orig_list, new_list, prepend=True):
     if prepend:
@@ -458,9 +612,21 @@ def _prepend_list(orig_list, new_list, prepend=True):
     #
     return orig_list
 
+def get_qspec_attr_list(qspec:QuantizationSpecBase):
+    attrs = []
+    for d in dir(qspec): 
+        if d.startswith('_') :
+            continue
+        attr = getattr(qspec, d)
+        if  isinstance(attr, (types.MethodType, types.FunctionType, type, Callable)):
+            continue
+        
+        attrs.append(d)
+    return attrs
+
 
 class TIDLRTQuantizerAdvanced(XNNPACKQuantizer):
-    NEW_ANNOTATION_STATIC_PATTERNS = ['conv_mul_add_relu', 'conv_mul_add', 'linear_add_relu', 'linear_add', 'mul_add', 'matmul']
+    NEW_ANNOTATION_STATIC_PATTERNS = ['conv_mul_add_relu', 'conv_mul_add', 'linear_add_relu', 'linear_add', 'mul_add', 'matmul', 'matmul_add', 'matmul_relu', 'matmul_add_relu', 'layernorm']
     NEW_ANNOTATION_DYNAMIC_PATTERNS = []
     _prepend_list(XNNPACKQuantizer.STATIC_OPS, NEW_ANNOTATION_STATIC_PATTERNS)
     _prepend_list(XNNPACKQuantizer.DYNAMIC_OPS, NEW_ANNOTATION_DYNAMIC_PATTERNS)
@@ -505,7 +671,8 @@ class TIDLRTQuantizerAdvanced(XNNPACKQuantizer):
         return model
     
     def annotate(self, model: torch.fx.GraphModule) -> torch.fx.GraphModule:
-        return super().annotate(model)
+        model = super().annotate(model)
+        return model
 
 
 def get_quantizer(is_qat=True, fast_mode=False, device=None, annotation_patterns=None, **kwargs):

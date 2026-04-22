@@ -9,6 +9,10 @@ from .... import xnn
 
 SPARSITY_CLASS_DICT = {}
 
+MASK_UPDATE_FREQ = None
+SR_STE_GAMMA = 0
+USE_STE = True
+
 def register_class(name, cls=None):
     """Registers a sparsity parametrization class with the global SPARSITY_CLASS_DICT.
     
@@ -92,10 +96,11 @@ class BaseSparsityParametrization(nn.Module):
         # Register mask and forward functions based on the derived class implementation
         self.register_masks()
         self.register_forwards()
+        self.forward_counter = 0
         
         # Create the sparsity mask from the tensor
         tensor = tensor.detach()
-        self.mask = self.create_mask(tensor)
+        self.register_buffer('mask', self.create_mask(tensor))
         
     def register_mask(self, *args, func=None):
         """Registers a mask creation function for this parametrization instance.
@@ -230,18 +235,20 @@ class BaseSparsityParametrization(nn.Module):
         """
         mask = self.get_mask_func(self.source)(tensor)
         # Apply binary thresholding if requested, otherwise use the soft mask
-        self.mask = (mask >= 0.5) if self.binary_mask else mask
+        mask = (mask >= 0.5) if self.binary_mask else mask
+        self.register_buffer('mask', mask)
         return self.mask
 
-    def update(self, tensor=None, mask=None, binary_mask=False):
+    def update(self, tensor=None, mask=None, binary_mask=False, new_epoch=True):
         """Update self, assuming an epoch has been completed. Update state (self.current_epoch) to reflect this.
         If mask != None, set the input mask as current mask
         If tensor != None, create a mask from tensor, based on the new self.current_epoch
 
         Args:
-            tensor (_type_, optional): Input tensor to create mask for. Defaults to None.
-            mask (_type_, optional): Input mask to directly set. Defaults to None.
+            tensor (Tensor, optional): Input tensor to create mask for. Defaults to None.
+            mask (Tensor, optional): Input mask to directly set. Defaults to None.
             binary_mask (bool, optional): If True, use hard mask (see self.create_mask). Defaults to False.
+            new_epoch (bool, optional): If True, update changes epoch count. Defaults to True.
 
         Raises:
             ValueError
@@ -250,17 +257,42 @@ class BaseSparsityParametrization(nn.Module):
             new updated mask, also sets self.mask
         """
         if mask is not None:
-            self.mask = mask 
-            return self.mask  
-        self.current_epoch += 1
+            self.register_buffer('mask', mask)
+            return self.mask 
+        if new_epoch:
+            self.current_epoch += 1
         self.binary_mask = binary_mask
         if tensor is None:
             raise ValueError(f"update_mask got tensor={tensor} with no mask input")
         if self.freeze_mask and self.current_epoch > self.sparsity_end_epoch:
             # Do not change mask
             return self.mask
-        self.mask = self.create_mask(tensor)
-        return self.mask 
+        old_mask = self.mask
+        self.register_buffer('mask', self.create_mask(tensor))
+        # self.mask = self.create_mask(tensor)
+        
+
+        # TODO, check verbose mode somewhere..
+        should_log = False
+        if MASK_UPDATE_FREQ is not None and MASK_UPDATE_FREQ < 100:
+            should_log = should_log and (new_epoch or (self.forward_counter % (50*MASK_UPDATE_FREQ) == 0))
+        if should_log:
+            try:
+                import mlflow
+                if mlflow.active_run():
+                    scaled_1 = old_mask.max().item()
+                    old_mask = (old_mask == scaled_1) # also works for topk where masked element is nonzero
+                    new_mask = self.mask
+                    scaled_1 = new_mask.max().item()
+                    new_mask = (new_mask==scaled_1)
+                    flip_rate = (old_mask!=new_mask).sum()/(old_mask.numel())
+                    if flip_rate < 0.5-(1e-5):
+                        mlflow.log_metric(f'flip_rate_{self.nodes[0].name}', flip_rate, step=self.forward_counter)
+                    # mlflow.log_metric('avg_weight_scale', scale_avg, step=current_epoch)
+                    # mlflow.log_metric('forward_counter', forward_counter, step=current_epoch)
+            except Exception:
+                pass
+            return self.mask 
         
     
     def forward(self, X):
@@ -270,6 +302,13 @@ class BaseSparsityParametrization(nn.Module):
         through the network. It applies the appropriate forward function based on the
         source identifier, with a default implementation of element-wise multiplication
         with the mask.
+
+        This is pretty much called anytime weight is accessed. Under normal training conditions, this would be in 
+        every forward pass, but it is possible that it is accessed elsewhere. The forward_counter update does not 
+        (cannot) distinguish between these cases.
+
+        Based on global property MASK_UPDATE_FREQ, update is called.
+        TODO: make this class property.
         
         Args:
             X (torch.Tensor): The original weight tensor.
@@ -278,6 +317,10 @@ class BaseSparsityParametrization(nn.Module):
             torch.Tensor: The modified weight tensor with sparsity applied.
         """
         default = lambda x: x * self.mask
+        self.forward_counter += 1
+        global MASK_UPDATE_FREQ
+        if MASK_UPDATE_FREQ is not None and self.forward_counter % MASK_UPDATE_FREQ == 0:
+            self.update(X, new_epoch=False)
         return self.get_forward_func(self.source, default)(X)
         
     def get_alpha_factor(self):
@@ -341,7 +384,7 @@ class BaseSparsityParametrization(nn.Module):
         self.alpha_factor = alpha_factor
         return self.alpha_factor
 
-STE_GAMMA = 0
+
 
 class MaskMul(torch.autograd.Function):
     @staticmethod
@@ -366,10 +409,23 @@ class MaskMul(torch.autograd.Function):
         
         # STE: according to chain rule, gradient should be grad_output*mask. Instead we allow grad_output to affect pruned weights as well
         # total_grad = grad_output*mask
-        global STE_GAMMA
-        total_grad = grad_output + STE_GAMMA*weights*mask_inverse
-        # print(f'maskmul: main= {(grad_output * mask).mean().item()} srste= {(STE_GAMMA*weights*mask_inverse).mean().item()}')
+        global SR_STE_GAMMA
+        global USE_STE
+        #TODO: make these parametrization class properties, and pass it in from parametrization class.
+        if USE_STE:
+            total_grad = grad_output + SR_STE_GAMMA*weights*mask_inverse
+        else:
+            return (grad_output * mask)
+        
         return total_grad, None
+
+
+class ConstMaskMul(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weights, mask):
+        # assumes mask is detached, and assumed not to be a function of weights
+        output = weights * mask
+        return output
 
 
 class SoftMaskMul(torch.autograd.Function):
@@ -377,7 +433,8 @@ class SoftMaskMul(torch.autograd.Function):
     def forward(ctx, weights, mask):
         n = 2
         alpha = mask.min().item()
-        m = 4 # pass these into forward ...
+        m = 4 # TODO pass these into forward ctx, through parametrization class.
+        # This would only be relevant if we go forward with this strategy, otherwise its too much change for no gain.
         tensor_reshaped = weights.view(-1, m)
         mask_reshaped = mask.view(-1,m)
         tensor_reshaped = torch.abs(tensor_reshaped)
@@ -387,34 +444,18 @@ class SoftMaskMul(torch.autograd.Function):
         max_chosen_values = tensor_reshaped.gather(1, max_chosen.unsqueeze(-1))
         max_chosen_values = max_chosen_values.expand(-1, m) # replicate the columns so future operations are easier
         
+        weights_reshaped = weights.view(-1, m).clone()
+        positive_unpruned = torch.logical_and(mask_reshaped==1, weights_reshaped > 0)
+        weights_reshaped = torch.where(positive_unpruned, weights_reshaped - (1-alpha)*max_chosen_values, weights_reshaped)
+        negative_unpruned = torch.logical_and(mask_reshaped==1, weights_reshaped < 0)
+        weights_reshaped = torch.where(negative_unpruned, weights_reshaped + (1-alpha)*max_chosen_values, weights_reshaped)
 
-        positive_unpruned = torch.logical_and(mask_reshaped==1, tensor_reshaped > 0)
-        tensor_reshaped = torch.where(positive_unpruned, tensor_reshaped - (1-alpha)*max_chosen_values, tensor_reshaped)
-        negative_unpruned = torch.logical_and(mask_reshaped==1, tensor_reshaped < 0)
-        tensor_reshaped = torch.where(negative_unpruned, tensor_reshaped + (1-alpha)*max_chosen_values, tensor_reshaped)
-
-        output = weights * mask
-
-
-            # max_chosen_values = tensor_reshaped.gather(1, max_chosen.unsqueeze(-1)).squeeze(-1)
-            # # Get the (1-alpha) smallest fraction so the largest pruned weight is minimized
-            # pruned = torch.topk(max_chosen_values, int((1.0-alpha_factor)*len(max_chosen_values)), largest=False)
-            # # For each 'row' in the alpha fraction above, prune the n smallest identified by wl
-            # soft_mask[pruned.indices] = soft_mask[pruned.indices].scatter(1, wl.indices[pruned.indices], 0) 
-
-        output = weights * mask
-        return output
-    
-    # @staticmethod
-    # inputs is a Tuple of all of the inputs passed to forward.
-    # output is the output of forward().
-    # def setup_context(ctx, inputs, output):
-        # weights, mask = inputs
-        # ctx.save_for_backward(weights, mask)
+        output = weights_reshaped * mask_reshaped
+        
+        return output.view(weights.shape)
     
     @staticmethod
     def backward(ctx, grad_output):
-        # weights, mask = ctx.saved_tensors
         # STE
         total_grad = grad_output
         return total_grad, None
@@ -429,8 +470,7 @@ class N2MSparsityParametrization(BaseSparsityParametrization):
     every 4 elements, resulting in 50% sparsity.
     
     Attributes:
-        REQUIRED_SPARSE_PARAMS (list): List of parameter names required from module.__sparse_params__
-            when applying the parametrization, extending the base class list with 'n' and 'm'.
+        TODO
     """
     # REQUIRED_SPARSE_PARAMS = ['n', 'm', 'mode', 'incremental_epochs'] + BaseSparsityParametrization.REQUIRED_SPARSE_PARAMS
     
@@ -442,7 +482,7 @@ class N2MSparsityParametrization(BaseSparsityParametrization):
 
         Args:
             source (_type_): Source identifier for the parametrization (e.g., layer type tuple).
-            nodes (_type_): Graph nodes to which the parametrization applies.
+            nodes (list[fx.Node]): Graph nodes to which the parametrization applies.
             n (int): The n value in n:m pattern (number of non-zero elements per block). Required.
             m (int): The m value in n:m pattern (block size). Required.
             mode (str, optional): Method for selecting elements to keep. Options are:
@@ -483,13 +523,39 @@ class N2MSparsityParametrization(BaseSparsityParametrization):
         
         super().__init__(source, nodes, *args, tensor=tensor, p=p, **kwargs)
     
-    def get_topk_mask(self, tensor, alpha_factor):
-        """Creates a sparsity mask using the top-k method.
+    
+    def _get_topk_mask(self, tensor, alpha_factor):
+        """
+        Assuming input tensor is 1-D or 2-D in this function: This should be called by self.get_topk_mask which handles the reshape logic.
+        If 2-D, second dim is expected to be divisible by m for good results.
+
+        Creates a sparsity mask using the top-k ot top-k-blockwise method.
         
-        This method creates a mask that keeps the top-n elements (by magnitude) in each
-        block of m elements, implementing the n:m sparsity pattern. Elements not in the
-        top-n are assigned the alpha_factor value, which controls the degree of sparsity
-        during training.
+        Mode = 'topk':
+            This method creates a mask that keeps the top-n elements (by magnitude) in each
+            block of m elements, implementing the n:m sparsity pattern. Elements not in the
+            top-n are assigned the alpha_factor value, which controls the degree of sparsity
+            during training.
+
+            The method works by:
+            1. Taking the absolute value of the tensor
+            2. Reshaping it to group elements into blocks of size m
+            3. Finding the bottom n elements (by magnitude) in each block
+            4. Setting those elements to alpha_factor in the mask
+            5. Reshaping the mask back to the original tensor shape
+        
+        Mode = 'topk_blockwise':
+            This method chooses an (1-alpha_factor) fraction of m-element blocks, and applies 
+            n:m sparsity on those blocks. These blocks are chosen so that the maximum pruned 
+            weight is minimized, in an attempt to minimize the impact of sparsification. Unlike
+            topk method, this creates zero values even at alpha_factor > 0 partial sparsity.
+
+            Method:
+            1. Take absolute value, reshape, find bottom n as before
+            2. Find the n'th smallest element in each m element block, i.e., largest weight to be pruned
+            3. Get the smallest (1-alpha_factor) of these elements
+            4. Apply n:m sparsity on this (1-alpha_factor) fraction of blocks by setting n smallest
+                elements to 0
         
         Args:
             tensor (torch.Tensor): The weight tensor to create a mask for.
@@ -499,14 +565,7 @@ class N2MSparsityParametrization(BaseSparsityParametrization):
         Returns:
             torch.Tensor: A mask tensor with the same shape as the input tensor.
                 Elements to keep have value 1, elements to prune have value alpha_factor.
-                
-        Note:
-            The method works by:
-            1. Taking the absolute value of the tensor
-            2. Reshaping it to group elements into blocks of size m
-            3. Finding the bottom n elements (by magnitude) in each block
-            4. Setting those elements to alpha_factor in the mask
-            5. Reshaping the mask back to the original tensor shape
+            
         """
         
         # tensor = torch.abs(tensor)
@@ -518,7 +577,7 @@ class N2MSparsityParametrization(BaseSparsityParametrization):
         tensor_reshaped = torch.abs(tensor_reshaped)
         
         # Initialize mask with all ones (keep all elements)
-        soft_mask = torch.ones_like(tensor_reshaped)
+        soft_mask = torch.ones_like(tensor_reshaped).detach()
         if alpha_factor == 1.0:
             return soft_mask.view(shape)
         
@@ -558,6 +617,29 @@ class N2MSparsityParametrization(BaseSparsityParametrization):
         elif self.scale_weights == 'init':
             #TODO: implement
             return soft_mask
+    
+    def get_topk_mask(self, tensor, alpha_factor):
+        """
+        Reshape tensor appropriately and call self._get_topk_mask(tensor, alpha_factor).
+        Tensor should be reshaped to 2-D so that dimension to be sparsified along is second dim, which should be divisible by m.
+        
+        NOT checking this condition here, since it should be checked when picking sparsifiable layers.
+        """
+        shape = tensor.shape
+        if len(shape) == 2:
+            # linear
+            return self._get_topk_mask(tensor, alpha_factor)
+        elif len(shape) == 4:
+            # assuming Conv2D weights
+            # TODO: check for other 4-dim weights
+
+            # by default weights is C_out x C_in x kernel[0] x kernel[1]
+            # change to sparsify along C_in dimension
+            tensor = tensor.permute((2,3,0,1)).contiguous().view(-1, shape[1])
+            mask = self._get_topk_mask(tensor, alpha_factor)
+            mask = mask.view(shape[2], shape[3], shape[0], shape[1]).permute((2,3,0,1)).contiguous()
+            return mask
+        return self._get_topk_mask(tensor, alpha_factor)
         
     def get_magnitude_mask(self, tensor, alpha_factor):
         """Creates a sparsity mask using the magnitude method.
@@ -639,7 +721,7 @@ class N2MSparsityParametrization(BaseSparsityParametrization):
             # It would probably be better to allow mask_gen_func to handle alpha computation as well
             if self.current_epoch < self.sparsity_start_epoch:
                 # No sparsity during initial training epochs
-                return torch.ones_like(tensor)
+                return torch.ones_like(tensor).detach()
             else:
                 # Calculate alpha factor and generate mask using selected mode
                 self.alpha_factor = self.get_alpha_factor()
@@ -702,8 +784,12 @@ class N2MSparsityParametrization(BaseSparsityParametrization):
         def default_forward(X):
             """Default forward function used by all layer types.
             
-            Simply applies the sparsity mask to the input tensor via
-            element-wise multiplication.
+            Applies the sparsity mask to the input tensor.
+            Default mask_mul_fn is MaskMul.apply, which does elementwise multiplication of 
+                mask and weights (and implements STE on backward pass).
+            ConstMaskMul.apply assumed mask is independent of weights (non STE)
+            mask_mul_fn = SoftMaskMul.apply is also possible, which uses a continuous function
+                for applying mask on weights.
             
             Args:
                 X (torch.Tensor): The input weight tensor.
@@ -711,7 +797,6 @@ class N2MSparsityParametrization(BaseSparsityParametrization):
             Returns:
                 torch.Tensor: The masked weight tensor.
             """
-            # return self.mask * X
             return self.mask_mul_fn(X, self.mask)
         
         # Register forward functions for different layer types

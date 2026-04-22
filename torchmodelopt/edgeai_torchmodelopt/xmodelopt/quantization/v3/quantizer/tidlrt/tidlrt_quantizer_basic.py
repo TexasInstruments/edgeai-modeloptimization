@@ -30,12 +30,15 @@
 #################################################################################
 
 import torch
-import torch.ao.quantization
-from torch.ao.quantization.quantizer.utils import (
-    _annotate_input_qspec_map,
-    _annotate_output_qspec
+# import torch.ao.quantization
+import torchao.quantization
+# from torch.ao.quantization.quantizer.utils import (
+from torchao.quantization.pt2e.quantizer.utils import (
+    annotate_input_qspec_map as _annotate_input_qspec_map,
+    annotate_output_qspec as _annotate_output_qspec
 )
-from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
+# from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
+from torchao.quantization.pt2e.quantizer.utils import (
     get_input_act_qspec,
     get_output_act_qspec,
     get_bias_qspec,
@@ -43,7 +46,8 @@ from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
     OperatorConfig,
     QuantizationConfig,
 )
-from torch.ao.quantization.quantizer.quantizer import (
+# from torch.ao.quantization.quantizer.quantizer import (
+from torchao.quantization.pt2e.quantizer.quantizer import (
     Quantizer,
     QuantizationAnnotation,
     SharedQuantizationSpec,

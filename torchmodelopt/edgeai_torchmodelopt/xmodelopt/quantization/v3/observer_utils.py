@@ -35,7 +35,8 @@ import random
 import warnings
 import torch
 import torch
-import torch.ao.quantization
+# import torch.ao.quantization
+import torchao.quantization
 
 from .... import xnn
 
@@ -100,9 +101,76 @@ def _correct_min_max(min_val: torch.Tensor, max_val: torch.Tensor) -> tuple[torc
 
 def _check_min_max_valid(min_val: torch.Tensor, max_val: torch.Tensor) -> bool:
     return True
-    
 
-def _calculate_qparams(func, min_val, max_val, quant_min, quant_max, symmetric, power2_scale, eps):
+
+def _calculate_qparams_modified( self, min_val, max_val, ):
+    # NOTE: This code is copied from torch.ao.quantization.observer.UniformQuantizationObserverBase._calculate_qparams
+    # or torchao.quantization.pt2e.UniformQuantizationObserverBase._calculate_qparams
+    # and modified for handling symmetric case only to make zeropoint 0 if all minvals are 0.
+    # TODO test for other cases.
+    quant_min, quant_max = self.quant_min, self.quant_max
+    min_val_neg = torch.min(min_val, torch.zeros_like(min_val))
+    max_val_pos = torch.max(max_val, torch.zeros_like(max_val))
+
+    device = min_val_neg.device
+    scale = torch.ones(min_val_neg.size(), dtype=torch.float32, device=device)
+    zero_point = torch.zeros(min_val_neg.size(), dtype=torch.int64, device=device)
+
+    if (
+        self.qscheme == torch.per_tensor_symmetric
+        or self.qscheme == torch.per_channel_symmetric
+    ):
+        max_val_pos = torch.max(-min_val_neg, max_val_pos)
+        min_val_neg_pos = torch.where(min_val_neg<0)[0]
+        if torch.any(min_val_neg<0):
+            scale = (max_val_pos / (float(quant_max - quant_min) / 2))
+            scale = torch.max(scale, self.eps)
+            if self.dtype in [torch.quint8, torch.uint8]:
+                if self.has_customized_qrange:
+                    # When customized quantization range is used, down-rounded midpoint of the range is chosen.
+                    zero_point = zero_point.new_full(
+                        zero_point.size(), (quant_min + quant_max) // 2
+                    )
+                else:
+                    zero_point = zero_point.new_full(zero_point.size(), 128)
+            elif self.dtype in [torch.uint16]:
+                zero_point = zero_point.new_full(zero_point.size(), 2**15)
+        else:
+            scale = (max_val_pos / (float(quant_max - quant_min)))
+            scale = torch.max(scale, self.eps)
+    elif self.qscheme == torch.per_channel_affine_float_qparams:
+        scale = (max_val - min_val) / float(quant_max - quant_min)
+        scale = torch.where(scale > self.eps, scale, torch.ones_like(scale))
+        # We use the quantize function
+        # xq = Round(Xf * inv_scale + zero_point),
+        # setting zero_point to (-1 * min *inv_scale) we get
+        # Xq = Round((Xf - min) * inv_scale)
+        zero_point = -1 * min_val / scale
+    else:
+        scale = (max_val_pos - min_val_neg) / float(quant_max - quant_min)
+        scale = torch.max(scale, self.eps)
+        zero_point = quant_min - torch.round(min_val_neg / scale).to(torch.int)
+        zero_point = torch.clamp(zero_point, quant_min, quant_max)
+
+    # For scalar values, cast them to Tensors of size 1 to keep the shape
+    # consistent with default values in FakeQuantize.
+    if len(scale.shape) == 0:
+        # TODO: switch to scale.item() after adding JIT support
+        scale = torch.tensor([float(scale)], dtype=scale.dtype, device=device)
+    if len(zero_point.shape) == 0:
+        # TODO: switch to zero_point.item() after adding JIT support
+        zero_point = torch.tensor(
+            [int(zero_point)], dtype=zero_point.dtype, device=device
+        )
+        if self.qscheme == torch.per_channel_affine_float_qparams:
+            zero_point = torch.tensor(
+                [float(zero_point)], dtype=zero_point.dtype, device=device
+            )
+
+    return scale, zero_point
+
+def _calculate_qparams(self, func, min_val, max_val,):
+    quant_min, quant_max, symmetric, power2_scale, eps = self.quant_min, self.quant_max, self.symmetric, self.power2_scale, self.eps
     min_val, max_val, range_valid = _correct_min_max(min_val, max_val)
     if range_valid:
         if symmetric:
@@ -110,8 +178,9 @@ def _calculate_qparams(func, min_val, max_val, quant_min, quant_max, symmetric, 
             max_abs = torch.max(torch.abs(min_val), torch.abs(max_val))
             min_val = -max_abs if signed_range else max_abs * 0.0
             max_val = max_abs
-        #
-        scale, zero_point = func(min_val, max_val)
+            scale, zero_point = _calculate_qparams_modified(self, min_val, max_val)
+        else:
+            scale, zero_point = func(min_val, max_val)
         if power2_scale:
             scale, zero_point = _adjust_qparams_power2_scale(
                 min_val, max_val, quant_min, quant_max, scale, zero_point, eps)
@@ -140,7 +209,8 @@ class RangeShrinkPercentileValues:
 
 
 ####################################################################
-class AdaptiveRangeShrinkObserver(torch.ao.quantization.HistogramObserver):
+# class AdaptiveRangeShrinkObserver(torch.ao.quantization.HistogramObserver):
+class AdaptiveRangeShrinkObserver(torchao.quantization.pt2e.HistogramObserver):
     def __init__(self, *args,  factory_kwargs=None, qscheme=torch.per_tensor_affine, 
                  power2_scale=False, range_max=None, fixed_range=False, 
                  range_shrink=True, dtype=torch.uint8, **kwargs):
@@ -273,7 +343,8 @@ class AdaptiveRangeClipObserver(AdaptiveRangeShrinkObserver):
     
 
 # not for quantization - only for use in teacher model of distillation
-class AdaptiveWeightRangeClipObserver(torch.ao.quantization.MinMaxObserver):
+# class AdaptiveWeightRangeClipObserver(torch.ao.quantization.MinMaxObserver):
+class AdaptiveWeightRangeClipObserver(torchao.quantization.pt2e.MinMaxObserver):
     def __init__(self, *args, dtype=torch.float32, **kwargs):
         temp_dtype = torch.int32 # just to satisfy base class which doesn't support float
         super().__init__(*args, dtype=temp_dtype, **kwargs)
@@ -288,7 +359,8 @@ class AdaptiveWeightRangeClipObserver(torch.ao.quantization.MinMaxObserver):
     
 
 # not for quantization - only for use in teacher model of distillation
-class AdaptivePerChannelWeightRangeClipObserver(torch.ao.quantization.PerChannelMinMaxObserver):
+# class AdaptivePerChannelWeightRangeClipObserver(torch.ao.quantization.PerChannelMinMaxObserver):
+class AdaptivePerChannelWeightRangeClipObserver(torchao.quantization.pt2e.PerChannelMinMaxObserver):
     def __init__(self, *args, dtype=torch.float32, **kwargs):
         temp_dtype = torch.int32 # just to satisfy base class which doesn't support float
         super().__init__(*args, dtype=temp_dtype, **kwargs)

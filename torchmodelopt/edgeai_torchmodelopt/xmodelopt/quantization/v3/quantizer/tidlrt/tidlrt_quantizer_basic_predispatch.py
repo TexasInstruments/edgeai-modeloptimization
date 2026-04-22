@@ -31,29 +31,29 @@
 
 import torch
 
-try:
-    import torchao
-except:
-    import torch.ao as torchao
-    from torch.ao.quantization.quantizer.utils import (
-        _annotate_input_qspec_map,
-        _annotate_output_qspec
-    )
-    from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
-        get_input_act_qspec,
-        get_output_act_qspec,
-        get_bias_qspec,
-        get_weight_qspec,
-        OperatorConfig,
-        QuantizationConfig,
-    )
-    from torch.ao.quantization.quantizer.quantizer import (
-        Quantizer,
-        QuantizationAnnotation,
-        SharedQuantizationSpec,
-        QuantizationSpec,
-        DerivedQuantizationSpec
-    )
+# import torch.ao as torchao
+# from torch.ao.quantization.quantizer.utils import (
+from torchao.quantization.pt2e.quantizer.utils import (
+    annotate_input_qspec_map as _annotate_input_qspec_map,
+    annotate_output_qspec as _annotate_output_qspec
+)
+# from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
+from torchao.quantization.pt2e.quantizer.utils import (
+    get_input_act_qspec,
+    get_output_act_qspec,
+    get_bias_qspec,
+    get_weight_qspec,
+    OperatorConfig,
+    QuantizationConfig,
+)
+# from torch.ao.quantization.quantizer.quantizer import (
+from torchao.quantization.pt2e.quantizer.quantizer import (
+    Quantizer,
+    QuantizationAnnotation,
+    SharedQuantizationSpec,
+    QuantizationSpec,
+    DerivedQuantizationSpec
+)
 
 # might move to torch/ao/quantization/utils.py later on
 # from torch.ao.quantization.pt2e.utils import _is_conv_or_conv_transpose_node
@@ -269,8 +269,8 @@ class TIDLRTPreDispatchQuantizerBasic(Quantizer):
     def _annotate_deformconv2d(
         self, gm: torch.fx.GraphModule, quantization_config: QuantizationConfig
     ) -> None:
-        from .....xops import DCNWithGSv2
-        from ....utils import get_source_partitions
+        from ......xops  import DCNWithGSv2
+        from .....utils import get_source_partitions
         deform_conv_partitions = get_source_partitions(
             gm.graph, [DCNWithGSv2]
         )
