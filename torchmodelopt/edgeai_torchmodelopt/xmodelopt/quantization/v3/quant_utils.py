@@ -30,6 +30,7 @@
 #################################################################################
 
 import torch
+import copy
 import statistics
 from torch.onnx import symbolic_helper, register_custom_op_symbolic
 from torch import nn
