@@ -145,6 +145,9 @@ class OptimizationBaseModule(nn.Module):
         # Extract the target device from args or kwargs
         device = kwargs.get('device', None) or args[0]
         
+        assert isinstance(device, torch.device) or \
+            (isinstance(device, str) and any(d in device for d in ('cpu', 'cuda')))
+        
         # Move the wrapped module to the device using transformation-aware function
         self.module = wrapped_transformation_fn(_model_to_device, self.module, 
                                                transformation_dict=self.transformation_dict, 

@@ -145,7 +145,14 @@ def get_layer_sparsity_ratio(*args, **kwargs):
     return wrapped_transformation_fn(sparsity_func.get_layer_sparsity_ratio, *args, **kwargs)
 
 def step(*args, **kwargs):
+    """
+        Increment epoch. Assume its called at the end of training/testing.
+    """
     return wrapped_transformation_fn(sparsity_func.step, *args, **kwargs)
 
 def finalize(*args, **kwargs):
+    """
+        Finalize model training, e.g., permanently apply sparsity. 
+        Assume its called at the end of the last training epoch.
+    """
     return wrapped_transformation_fn(sparsity_func.finalize, *args, **kwargs)

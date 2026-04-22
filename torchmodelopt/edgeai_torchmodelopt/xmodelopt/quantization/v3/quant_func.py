@@ -32,15 +32,19 @@
 import warnings
 import torch
 from torch.fx import GraphModule
-import torch.ao.quantization
-from torch.ao.quantization.quantize_pt2e import prepare_pt2e, prepare_qat_pt2e, convert_pt2e 
-	
+# import torch.ao.quantization
+import torchao.quantization
+# from torch.ao.quantization.pt2e.quantize_pt2e import prepare_pt2e, prepare_qat_pt2e, convert_pt2e 
+from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, prepare_qat_pt2e, convert_pt2e 
+# from torch.ao.quantization.utils import _assert_and_get_unique_device
+from torchao.quantization.pt2e.utils import _assert_and_get_unique_device
+
 from .... import xnn
 from ... import utils
 from . import qconfig_types
 from . import quant_utils
 from .quantizer import get_quantizer, QuantizerTypes, QuantizerAnnotationPatterns
-from ...utils.helper_functions import allow_exported_model_train_eval
+from ...utils.helper_functions import allow_exported_model_train_eval, _EXPORTED_TRAINING_ATTR, get_tensors_to_device, _move_exported_model_to_eval, _move_exported_model_to_train
 
 import copy
 import os
@@ -64,7 +68,7 @@ def _switch_batchnorm(model, training):
     model.recompile()  
 
     
-def init(model, example_inputs, example_kwargs=None, is_qat=True, total_epochs=0, 
+def init(model, *args, example_inputs=None, example_kwargs=None, is_qat=True, total_epochs=0, 
          quantizer=None, qconfig_type=None, quantizer_type=None, annotation_patterns=None,
          num_batch_norm_update_epochs=None, num_observer_update_epochs=None, 
          add_methods=True, fast_mode=False, device=None, **kwargs):
@@ -99,35 +103,46 @@ def init(model, example_inputs, example_kwargs=None, is_qat=True, total_epochs=0
     
     #####################################################################################
     example_kwargs = example_kwargs or {}
-    
-    if not (hasattr(model, '_example_inputs') and hasattr(model, '_example_kwargs')):
-        utils.add_example_args_kwargs(model, example_inputs=example_inputs, example_kwargs=example_kwargs)
-        
-    example_inputs = model._example_inputs.pop(0)
-    example_kwargs = model._example_kwargs.pop(0)
-    # devices = {p.device for p in model.parameters()} | {
-    #     p.device for p in model.buffers()
-    # }
-    # assert len(devices) <=1, f'All tensors of the model should be in 1 device, but found in {len(devices)} devices'
-    # device = device or list(devices)[0]
-    from ...utils.helper_functions import allow_exported_model_train_eval, get_tensors_to_device
-    from torch.ao.quantization.utils import _assert_and_get_unique_device
-    device = device or _assert_and_get_unique_device(model)
-    if device:
-        example_inputs = get_tensors_to_device(example_inputs, device)
-        example_kwargs = get_tensors_to_device(example_kwargs, device)
-        model = _model_to_device(model, device)
 
     #####################################################################################
     orig_model =  copy.deepcopy(model) if kwargs.get('with_deepcopy', False) else model
     check_guards = kwargs.get('check_guards', True)
-    example_inputs = tuple(example_inputs)
     if isinstance(orig_model, torch.fx.GraphModule):
-        m = orig_model
+        gm_module = orig_model
     else:
-        m = torch.export.export(orig_model, example_inputs, kwargs=example_kwargs).module(check_guards=check_guards)
-    allow_exported_model_train_eval(m)
+        
+        if not (hasattr(model, '_example_inputs') and len(model._example_inputs) and hasattr(model, '_example_kwargs') and len(model._example_kwargs)):
+            utils.add_example_args_kwargs(model, example_inputs=example_inputs, example_kwargs=example_kwargs)
+            
+        example_inputs = model._example_inputs.pop(0)
+        example_kwargs = model._example_kwargs.pop(0)
+        # devices = {p.device for p in model.parameters()} | {
+        #     p.device for p in model.buffers()
+        # }
+        # assert len(devices) <=1, f'All tensors of the model should be in 1 device, but found in {len(devices)} devices'
+        # device = device or list(devices)[0]
+        device = device or _assert_and_get_unique_device(model)
+        if device:
+            example_inputs = get_tensors_to_device(example_inputs, device)
+            example_kwargs = get_tensors_to_device(example_kwargs, device)
+            model = _model_to_device(model, device)
+        example_inputs = tuple(example_inputs)
+        gm_module = torch.export.export(orig_model, example_inputs, kwargs=example_kwargs).module(check_guards=check_guards)
+        gm_module(*example_inputs, **example_kwargs)
+    gm_module = quant_utils.optimize_graph_module_for_quantization(gm_module)
+    allow_exported_model_train_eval(gm_module)
+    if example_inputs and example_kwargs:
+        gm_module(*example_inputs, **example_kwargs)
     
+    is_node_variable_dict: dict[torch.fx.Node:bool] = {}
+    for node in gm_module.graph.nodes:
+        if node.op == 'placeholder':
+            is_node_variable_dict[node] = True
+        elif node.op == 'get_attr':
+            is_node_variable_dict[node] = False
+        else:
+            is_node_variable_dict[node] = any(is_node_variable_dict[n] for n in node._input_nodes)
+    gm_module._is_node_variable_dict = is_node_variable_dict
     # for copy_arg in copy_args:
     #     if hasattr(module, copy_arg):
     #         setattr(replace_obj, copy_arg, getattr(module, copy_arg))
@@ -135,12 +150,13 @@ def init(model, example_inputs, example_kwargs=None, is_qat=True, total_epochs=0
     #####################################################################################
     if is_qat: # set to true above
         # we are always inserting fake quantize (QDQ), if needed we can differentiate
-        prepared_model = prepare_qat_pt2e(m, quantizer)
+        prepared_model = prepare_qat_pt2e(gm_module, quantizer)
     else:
-        prepared_model = prepare_pt2e(m, quantizer)
+        prepared_model = prepare_pt2e(gm_module, quantizer)
     
     prepared_model = _model_to_device(prepared_model, device)
-
+    # from edgeai_torchmodelopt.xnn.utils import save_torch_graph_as_onnx
+    # save_torch_graph_as_onnx(prepared_model,'vit_b_16_prepared_temp')
     #####################################################################################
     prepared_model.__quant_params__ = xnn.utils.AttrDict()
     prepared_model.__quant_params__.is_qat = is_qat
@@ -165,7 +181,7 @@ def init(model, example_inputs, example_kwargs=None, is_qat=True, total_epochs=0
         #     else:
         #         torch.ao.quantization.move_exported_model_to_eval(self)
                 
-        prepared_model.__quant_train_backup__ = types.MethodType(m.train.__func__, prepared_model) 
+        prepared_model.__quant_train_backup__ = types.MethodType(gm_module.train.__func__, prepared_model) 
         prepared_model.train = types.MethodType(train, prepared_model)
         prepared_model.eval = types.MethodType(eval, prepared_model)
         # other methods
@@ -208,19 +224,23 @@ def freeze(self, freeze_bn=True, freeze_observers=True):
     
     # this does not work, neither causes any harm, just here for future
     if freeze_observers:
-        self.apply(torch.ao.quantization.disable_observer)
+        # self.apply(torch.ao.quantization.disable_observer)
+        self.apply(torchao.quantization.pt2e.disable_observer)
     else:
-        self.apply(torch.ao.quantization.enable_observer)
+        # self.apply(torch.ao.quantization.enable_observer)
+        self.apply(torchao.quantization.pt2e.enable_observer)
     
     # this does not work, neither causes any harm, just here for future
     if freeze_bn is True:
         self.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
         # TODO: check if this is causing accuracy degradation
-        torch.ao.quantization.move_exported_model_to_eval(self)  
+        # torch.ao.quantization.move_exported_model_to_eval(self)  
+        _move_exported_model_to_eval(self)  
         # _switch_batchnorm(self, training=False)
     elif freeze_bn is False:
         self.apply(torch.nn.intrinsic.qat.update_bn_stats)
-        torch.ao.quantization.move_exported_model_to_train(self)
+        # torch.ao.quantization.move_exported_model_to_train(self)
+        _move_exported_model_to_train(self)
         # _switch_batchnorm(self, training=True)
 
     # device = self.__quant_params__.device
@@ -307,22 +327,25 @@ def _convert_layers(module, fq_type, new_type):
     return module
 
 
-def convert(self, *args, device="cpu", make_copy=False, fq_to_clip=None, **kwargs):
+def convert(self, *args, device=None, make_copy=False, fq_to_clip=None, **kwargs):
     if hasattr(self, '__quant_params__'):
         orig_quant_params = self.__quant_params__
         fq_to_clip = (self.__quant_params__.qconfig_type == qconfig_types.QConfigType.WF_AFCLIP) if fq_to_clip is None else fq_to_clip
     else:
         warnings.warn("WARNING: __quant_params__ is missing in quant_func module.")
         orig_quant_params = None
-
+    
+    device = device or _assert_and_get_unique_device(self)
     model = copy.deepcopy(self) if make_copy else self # calls the deepcopy_graphmodule module
-    model = _model_to_device(model, device)
+    model = _model_to_device(model, device) if device else model
     model = quant_utils.move_node_kwargs_to_device(model, device=device)
     model = quant_utils.remove_to_device_node(model)
 
     if fq_to_clip:
-        model = _convert_layers(model, torch.ao.quantization.FakeQuantize, torch.nn.Hardtanh)
-        model = _convert_layers(model, torch.ao.quantization.observer.PlaceholderObserver, torch.nn.Identity)
+        # model = _convert_layers(model, torch.ao.quantization.FakeQuantize, torch.nn.Hardtanh)
+        model = _convert_layers(model, torchao.quantization.pt2e.FakeQuantize, torch.nn.Hardtanh)
+        # model = _convert_layers(model, torch.ao.quantization.observer.PlaceholderObserver, torch.nn.Identity)
+        model = _convert_layers(model, torchao.quantization.pt2e.observer.PlaceholderObserver, torch.nn.Identity)
         model.graph.lint()
         model.recompile()
     else:
@@ -345,6 +368,43 @@ def convert(self, *args, device="cpu", make_copy=False, fq_to_clip=None, **kwarg
     return model
 
 
+def apply_bn_observer_freeze(self, freeze_bn=False, freeze_observers=False):
+    # set the default epoch at which freeze occurs during training (if missing)
+    num_batch_norm_update_epochs = ((self.__quant_params__.total_epochs//2)-1) \
+        if self.__quant_params__.num_batch_norm_update_epochs is None else int(self.__quant_params__.num_batch_norm_update_epochs)
+    
+    num_observer_update_epochs = ((self.__quant_params__.total_epochs//2)+1) \
+        if self.__quant_params__.num_observer_update_epochs is None else int(self.__quant_params__.num_observer_update_epochs)
+    num_observer_update_epochs = max(num_observer_update_epochs, 1) # must run observer for atleast 1 epoch - otherwise range will not be availble and fake_quatize will have errors.
+
+    freeze_bn = freeze_bn or (self.__quant_params__.num_epochs_tracked >= num_batch_norm_update_epochs)
+    freeze_observers = freeze_observers or (self.__quant_params__.num_epochs_tracked >= num_observer_update_epochs)
+
+    if freeze_bn:
+        xnn.utils.print_once('INFO: Freezing BN for subsequent quantization epochs')
+    #
+    if freeze_observers:
+        xnn.utils.print_once('INFO: Freezing ranges for subsequent quantization epochs')
+    #
+    freeze(self, freeze_bn=freeze_bn, freeze_observers=freeze_observers)
+    
+    # TODO: we will probably need better logic to extend to adding more hooks in the toolkit #TODO
+    # if len(self.__quant_params__.outlier_hooks)==0 and not(freeze_observers):
+    #     self = insert_all_hooks(self, outlier_clipping=True, bias_calibration=False)
+    # if len(self.__quant_params__.bias_hooks)==0:
+    #     self = insert_all_hooks(self, outlier_clipping=False, bias_calibration=True)
+
+    # Removing the outlier hook when the observers are also frozen
+    if freeze_observers and len(self.__quant_params__.outlier_hooks)>0:
+        self.__quant_params__.outlier_hooks = remove_hooks(self.__quant_params__.outlier_hooks)
+
+
+def step(self,):
+    apply_bn_observer_freeze(self)
+    self.__quant_params__.num_epochs_tracked += 1
+    return self
+
+
 def train(self, mode: bool = True):
     # hf transformers call train before every iteration, which messes with epochs tracked, will be needing a better logic for that #TODO
     # as of now, pass the expected number of epochs in num_batch_norm_update_epochs and num_observer_update_epochs variables, same is expected 
@@ -353,43 +413,12 @@ def train(self, mode: bool = True):
     if hasattr(self, "__quant_train_backup__"):
         self.__quant_train_backup__(mode=mode)
     # also freeze the params if required
-    if mode is True:
-        # set the default epoch at which freeze occurs during training (if missing)
-        num_batch_norm_update_epochs = ((self.__quant_params__.total_epochs//2)-1) \
-            if self.__quant_params__.num_batch_norm_update_epochs is None else int(self.__quant_params__.num_batch_norm_update_epochs)
-        
-        num_observer_update_epochs = ((self.__quant_params__.total_epochs//2)+1) \
-            if self.__quant_params__.num_observer_update_epochs is None else int(self.__quant_params__.num_observer_update_epochs)
-        num_observer_update_epochs = max(num_observer_update_epochs, 1) # must run observer for atleast 1 epoch - otherwise range will not be availble and fake_quatize will have errors.
-
-        freeze_bn = (self.__quant_params__.num_epochs_tracked >= num_batch_norm_update_epochs)
-        freeze_observers = (self.__quant_params__.num_epochs_tracked >= num_observer_update_epochs)
-
-        if freeze_bn:
-            xnn.utils.print_once('INFO: Freezing BN for subsequent quantization epochs')
-        #
-        if freeze_observers:
-            xnn.utils.print_once('INFO: Freezing ranges for subsequent quantization epochs')
-        #
-        freeze(self, freeze_bn=freeze_bn, freeze_observers=freeze_observers)
-        
-        # TODO: we will probably need better logic to extend to adding more hooks in the toolkit #TODO
-        # if len(self.__quant_params__.outlier_hooks)==0 and not(freeze_observers):
-        #     self = insert_all_hooks(self, outlier_clipping=True, bias_calibration=False)
-        # if len(self.__quant_params__.bias_hooks)==0:
-        #     self = insert_all_hooks(self, outlier_clipping=False, bias_calibration=True)
-
-        # Removing the outlier hook when the observers are also frozen
-        if freeze_observers and len(self.__quant_params__.outlier_hooks)>0:
-            self.__quant_params__.outlier_hooks = remove_hooks(self.__quant_params__.outlier_hooks)
-          
-        self.__quant_params__.num_epochs_tracked += 1
-    else:
+    if mode is False:
         # TODO: add later as required
         # self.__quant_params__.bias_hooks = remove_hooks(self.__quant_params__.bias_hooks)                      
         # self.__quant_params__.outlier_hooks = remove_hooks(self.__quant_params__.outlier_hooks)
         freeze(self)
-    #
+
     return self
 
 
@@ -432,28 +461,35 @@ def export(self, example_inputs, example_kwargs=None, filename='model.onnx', ops
     else:
         model = self
         warnings.warn("model has already been converted before calling export. make sure it is done correctly.")
+    model = _model_to_device(model, device)
 
     model.module = quant_utils.remove_loss_branch(model.module)
     quant_utils.register_onnx_symbolics(opset_version)
     
     from ...utils.helper_functions import get_tensors_to_device
     
+    model = model.module
     input_to_export = get_tensors_to_device(example_inputs, device)
     kwargs_to_export = get_tensors_to_device(example_kwargs, device)
 
     external_data = export_kwargs.pop('external_data',False)
-    dynamo = export_kwargs.pop('dynamo',True)
+    dynamo = export_kwargs.pop('dynamo',False)
+    training = export_kwargs.get('training', torch._C._onnx.TrainingMode.EVAL) 
     custom_translation_table:dict = export_kwargs.pop('custom_translation_table',{})
     assert isinstance(custom_translation_table, dict)
-    custom_translation_table.update(((k,v) for k,v in quant_utils.get_custom_onnx_translation_table(opset_version).items() if k not in custom_translation_table))
+    if dynamo:
+        custom_translation_table.update(((k,v) for k,v in quant_utils.get_custom_onnx_translation_table(opset_version).items() if k not in custom_translation_table))
+    if not dynamo and self.quantization_kwargs:
+        model = quant_utils.remove_loss_branch(model)
+        quant_utils.register_onnx_symbolics(opset_version)
     import onnx
     import onnxruntime as ort
-    if model_qconfig_format == qconfig_types.QConfigFormat.INT_MODEL:
+    if self.quantization_kwargs and model_qconfig_format == qconfig_types.QConfigFormat.INT_MODEL:
         # # Convert QDQ format to Int8 format
-        
+
         qdq_filename = os.path.splitext(filename)[0] + '_qdq.onnx'
         torch.onnx.export(model, input_to_export, qdq_filename, kwargs=kwargs_to_export,custom_translation_table=custom_translation_table,
-                          opset_version=opset_version, external_data=external_data, dynamo=dynamo, training=torch._C._onnx.TrainingMode.PRESERVE, **export_kwargs)
+                        opset_version=opset_version, external_data=external_data, dynamo=dynamo, training=training, **export_kwargs)
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
         so.optimized_model_filepath = filename
@@ -463,8 +499,8 @@ def export(self, example_inputs, example_kwargs=None, filename='model.onnx', ops
             os.remove(qdq_filename)
         #
     else:
-        torch.onnx.export(model, input_to_export, filename, kwargs=kwargs_to_export, custom_translation_table=custom_translation_table, 
-                          opset_version=opset_version,external_data=external_data, dynamo=dynamo, training=torch._C._onnx.TrainingMode.PRESERVE, **export_kwargs)
+        torch.onnx.export(model, input_to_export, filename, kwargs=kwargs_to_export, custom_translation_table=custom_translation_table,
+                        opset_version=opset_version,external_data=external_data, dynamo=dynamo, training=training, **export_kwargs)
 
     if simplify:
         from onnxsim import simplify

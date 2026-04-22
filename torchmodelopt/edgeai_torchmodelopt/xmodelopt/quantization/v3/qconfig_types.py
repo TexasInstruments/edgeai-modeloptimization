@@ -32,15 +32,25 @@
 import torch
 import enum
 
-import torch.ao.quantization
-from torch.ao.quantization.quantizer.quantizer import (
+# import torch.ao.quantization
+import torchao.quantization
+from typing import TYPE_CHECKING
+import copy, types
+
+# from torch.ao.quantization.quantizer.quantizer import (
+# import torchao.quantization.pt2e.quantizer.quantizer as Q
+
+from torchao.quantization.pt2e.quantizer.quantizer import (
     Quantizer,
     QuantizationAnnotation,
     SharedQuantizationSpec,
     QuantizationSpec
 )
-from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import QuantizationConfig
-from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
+# from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import QuantizationConfig
+from torchao.quantization.pt2e.quantizer import QuantizationConfig
+# from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
+if TYPE_CHECKING:
+    from torchao.quantization.pt2e import _ObserverOrFakeQuantizeConstructor
 
 from .... import xnn
 
@@ -72,6 +82,7 @@ class QConfigFormat:
 class QConfigType():
     DISABLED = 0
     WC8_AT8 = "WC8_AT8"                         # per-channel quantization for weights, per-tensor quantization for activations
+    WC16_AT16 = "WC16_AT16"                     # per-channel quantization for weights, per-tensor quantization for activations int 16 bit
     
     MSA_WC8SYM_AT8SYM = "MSA_WC8SYM_AT8SYM"     # WC8SYM_AT8SYM + no range shrink (mostly for attention networks with important peaks)
 
@@ -167,7 +178,8 @@ def get_weight_quantization_spec(weight_qconfig, is_qat=True):
             quant_max=None,
             qscheme=weight_qscheme,
             is_dynamic=False,
-            observer_or_fake_quant_ctr=torch.ao.quantization.observer.PlaceholderObserver
+            # observer_or_fake_quant_ctr=torch.ao.quantization.observer.PlaceholderObserver
+            observer_or_fake_quant_ctr=torchao.quantization.pt2e.PlaceholderObserver
         )
     else:
         raise RuntimeError("ERROR: Unsupported weight quantization dtype: " + str(weight_dtype))
@@ -232,7 +244,8 @@ def get_act_quantization_spec(activation_qconfig, is_qat=True, fast_mode=False):
             quant_max=None,
             qscheme=activation_qscheme,
             is_dynamic=False,
-            observer_or_fake_quant_ctr=torch.ao.quantization.observer.PlaceholderObserver
+            # observer_or_fake_quant_ctr=torch.ao.quantization.observer.PlaceholderObserver
+            observer_or_fake_quant_ctr=torchao.quantization.pt2e.PlaceholderObserver
         )
     else:
         raise RuntimeError("ERROR: Unsupported activation quantization dtype: " + str(activation_dtype))
@@ -245,7 +258,8 @@ def get_quantization_config(qconfig_dict, is_qat=False, fast_mode=False):
     weight_quantization_spec = get_weight_quantization_spec(qconfig_dict.get('weight', dict()), is_qat=is_qat)
     act_quantization_spec = get_act_quantization_spec(qconfig_dict.get('activation', dict()), is_qat=is_qat, fast_mode=fast_mode)
 
-    bias_observer_or_fake_quant_ctr: _ObserverOrFakeQuantizeConstructor = torch.ao.quantization.observer.PlaceholderObserver
+    # bias_observer_or_fake_quant_ctr: _ObserverOrFakeQuantizeConstructor = torch.ao.quantization.observer.PlaceholderObserver
+    bias_observer_or_fake_quant_ctr: _ObserverOrFakeQuantizeConstructor = torchao.quantization.pt2e.PlaceholderObserver
     bias_quantization_spec = QuantizationSpec(
         dtype=torch.float,
         observer_or_fake_quant_ctr=bias_observer_or_fake_quant_ctr
@@ -267,7 +281,13 @@ def get_quantization_config_default(qconfig_type, is_qat=True, fast_mode=False):
     # per-channel
     _QCONFIG_TYPE_TO_DICT[QConfigType.WC8_AT8] = get_quantization_config(dict(
         weight=dict(qscheme=torch.per_channel_symmetric),
-        activation=dict(qscheme=torch.per_tensor_affine)), 
+        activation=dict(qscheme=torch.per_tensor_affine,)),# range_shrink=True
+        is_qat=is_qat, fast_mode=fast_mode)
+    
+    # per-channel int16-bits
+    _QCONFIG_TYPE_TO_DICT[QConfigType.WC16_AT16] = get_quantization_config(dict(
+        weight=dict(dtype=torch.int16, bitwidth=16, qscheme=torch.per_channel_symmetric),
+        activation=dict(dtype=torch.int16, bitwidth=16, qscheme=torch.per_tensor_affine, range_shrink=True)), 
         is_qat=is_qat, fast_mode=fast_mode)
 
     # per-channel transformers
@@ -350,3 +370,44 @@ def get_qconfig(qconfig_type=None, is_qat=True, fast_mode=False):
         raise RuntimeError("Unknown qconfig_type: " + str(qconfig_type))
     #
     return qconfig_obj
+
+
+def create_qspec_deepcopy_with_kwargs(qspec:QuantizationSpec, is_qat=True, **kwargs):
+    attr_list = [d for d in dir(qspec) if not d.startswith('_') and not isinstance(getattr(qspec, d),(types.FunctionType, types.MethodType))]
+    qspec1 =  copy.deepcopy(qspec)
+    attrs = {}
+    for attr in attr_list:
+        if hasattr(qspec1, attr):
+            attrs[attr] = getattr(qspec1, attr)
+    for k,v in kwargs.items():
+        if k in attrs:
+            attrs[k] = v
+    
+    if hasattr(qspec1, 'observer_or_fake_quant_ctr'):
+        obs_or_fq_const = qspec1.observer_or_fake_quant_ctr
+        obs_const = obs_or_fq_const
+        if is_qat:
+            # obs_or_fq_const.p.keywords = copy.deepcopy(obs_or_fq_const.p.keywords)
+            obs_const = obs_or_fq_const.p.keywords['observer']
+            for k,v in kwargs.items():
+                if k in obs_or_fq_const.p.keywords:
+                    obs_or_fq_const.p.keywords[k] = v
+    
+        args = copy.deepcopy(obs_const.__init__._partialmethod.args)
+        # obs_const.__init__._partialmethod.keywords = copy.deepcopy(obs_const.__init__._partialmethod.keywords)
+        keywords = copy.deepcopy(obs_const.__init__._partialmethod.keywords)
+        for k,v in kwargs.items():
+            if k in keywords:
+                keywords[k] = v
+    
+        new_obs_const = xnn.utils.partialclass(obs_const.mro()[1],*args, **keywords)
+        if is_qat:
+            obs_or_fq_const.p.keywords['observer'] = new_obs_const
+        else:
+            obs_or_fq_const = new_obs_const
+    
+        attrs['observer_or_fake_quant_ctr'] = obs_or_fq_const
+    
+    qspec_copy = type(qspec1)(**attrs)
+    
+    return qspec_copy

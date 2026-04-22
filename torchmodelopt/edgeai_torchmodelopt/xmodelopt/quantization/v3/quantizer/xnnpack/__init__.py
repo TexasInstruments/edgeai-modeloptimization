@@ -34,10 +34,14 @@
 import copy
 from typing import List
 
-from torch.ao.quantization.quantizer.xnnpack_quantizer import XNNPACKQuantizer
-from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import *
-from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import register_annotator, AnnotatorType
-from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import _is_annotated, _mark_nodes_as_annotated, _is_input_large_scalar, _is_input_non_float_tensor
+# from torch.ao.quantization.quantizer.xnnpack_quantizer import XNNPACKQuantizer
+from torchao.testing.pt2e._xnnpack_quantizer import XNNPACKQuantizer
+# from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import *
+from torchao.testing.pt2e._xnnpack_quantizer_utils import *
+# from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import register_annotator, AnnotatorType
+from torchao.testing.pt2e._xnnpack_quantizer_utils import register_annotator, AnnotatorType
+# from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import _is_annotated, _mark_nodes_as_annotated, _is_input_large_scalar, _is_input_non_float_tensor
+from torchao.testing.pt2e._xnnpack_quantizer_utils import _is_annotated, _mark_nodes_as_annotated, _is_input_large_scalar, _is_input_non_float_tensor
 
 
 def get_annotation_func(op=None):

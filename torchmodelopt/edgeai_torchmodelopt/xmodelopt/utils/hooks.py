@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from .transformation_utils import wrapped_transformation_fn
+from collections import OrderedDict
 
 def detach_all_tensors(vals):
     """Recursively detaches all tensors from the computation graph.
@@ -19,6 +20,8 @@ def detach_all_tensors(vals):
         return tuple([detach_all_tensors(v) for v in vals])
     if isinstance(vals, list):
         return list([detach_all_tensors(v) for v in vals])
+    elif isinstance(vals, OrderedDict):
+        return OrderedDict([(k, detach_all_tensors(v)) for k, v in vals.items()])
     elif isinstance(vals, dict):
         return {k: detach_all_tensors(v) for k, v in vals.items()}
     elif isinstance(vals, torch.Tensor):

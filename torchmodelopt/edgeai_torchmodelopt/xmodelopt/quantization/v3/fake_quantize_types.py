@@ -32,7 +32,8 @@
 import warnings
 import math
 import torch
-from torch.ao.quantization import FakeQuantize
+# from torch.ao.quantization import FakeQuantize
+from torchao.quantization.pt2e import FakeQuantize
 from .... import xnn
 from . import observer_utils
 
@@ -55,6 +56,7 @@ class AdaptiveFakeQuantize(FakeQuantize):
         else:
             # X = torch.where(torch.isfinite(X), X, observer_utils.eps)
             x_q = super().forward(X)
+            
             self.num_batches_tracked += 1
             return x_q
 
@@ -69,7 +71,13 @@ class AdaptiveWeightFakeQuantize(AdaptiveFakeQuantize):
         sparsity_mask = (X != 0).detach()
         X = X * sparsity_mask
         # this is the actual fake_quntize
+        changed = False
+        if len(X.shape) ==1:
+            X = X.reshape(-1, 1)
+            changed = True
         x_q = super().forward(X)
+        if changed:
+            x_q = x_q.flatten()
         return x_q
 
 

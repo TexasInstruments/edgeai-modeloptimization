@@ -39,7 +39,7 @@ class QuantPT2EBaseModule(OptimizationBaseModule):
         model: input model to be used for QAT / PTC
         qconfig_type: qconfig_type can be one of the modes defined in qconfig_types (string)
             or it can be a dict that will be passed to qconfig_types.get_config_from_dict()
-            it can also be an instance of torch.ao.quantization.QConfig as used when using torch.ao.quantization apis
+            it can also be an instance of torchao.quantization.pt2e.QConfig as used when using torchao.quantization apis
         '''
         # self.module = quant_func.init(model, *args, add_methods=add_methods, **kwargs)
         copy_attrs= copy_attrs or []
@@ -104,7 +104,7 @@ class QuantPT2EBaseModule(OptimizationBaseModule):
         return model
     
     def export(self, *args, **kwargs):
-        converted_model = self.convert(*args, **kwargs)
+        converted_model = self.convert(make_copy=True, device=kwargs.get('device', 'cpu'))
         quant_func_wrapper.export(converted_model, *args, transformation_dict=self.transformation_dict, is_converted=True, **kwargs)
         return self
 
