@@ -471,7 +471,8 @@ def export(self, example_inputs, example_kwargs=None, filename='model.onnx', ops
     model = model.module
     input_to_export = get_tensors_to_device(example_inputs, device)
     kwargs_to_export = get_tensors_to_device(example_kwargs, device)
-
+    input_to_export = tuple(input_to_export)
+    
     external_data = export_kwargs.pop('external_data',False)
     dynamo = export_kwargs.pop('dynamo',False)
     training = export_kwargs.get('training', torch._C._onnx.TrainingMode.EVAL) 
@@ -479,12 +480,12 @@ def export(self, example_inputs, example_kwargs=None, filename='model.onnx', ops
     assert isinstance(custom_translation_table, dict)
     if dynamo:
         custom_translation_table.update(((k,v) for k,v in quant_utils.get_custom_onnx_translation_table(opset_version).items() if k not in custom_translation_table))
-    if not dynamo and self.quantization_kwargs:
+    if not dynamo:
         model = quant_utils.remove_loss_branch(model)
         quant_utils.register_onnx_symbolics(opset_version)
     import onnx
     import onnxruntime as ort
-    if self.quantization_kwargs and model_qconfig_format == qconfig_types.QConfigFormat.INT_MODEL:
+    if model_qconfig_format == qconfig_types.QConfigFormat.INT_MODEL:
         # # Convert QDQ format to Int8 format
 
         qdq_filename = os.path.splitext(filename)[0] + '_qdq.onnx'
