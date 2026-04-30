@@ -11,3 +11,6 @@
 * It can be installed by cloning the edgeai-tidl-tools repository and running the setup script [here](https://github.com/TexasInstruments/edgeai-tidl-tools/tree/master/osrt-model-tools)
 * It can also be installed by `pip install git+https://github.com/TexasInstruments/edgeai-tidl-tools.git#subdirectory=osrt-model-tools`
 * This is already included in the setup scripts of edgeai-tidl-tools and edgeai-benchmark
+
+## Relese Notes
+* [2026-April-30] torchmodelopt has been updated to use torchao for pt2e based quantization and sparsity (v3)
